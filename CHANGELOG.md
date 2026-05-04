@@ -23,7 +23,6 @@ same language.
 ### What you can now do
 
 - **Trust that any plan-* review skill that produces a plan file ends with the review report.** All four plan-mode E2E tests (`plan-eng`, `plan-ceo`, `plan-design`, `plan-devex`) now assert `## GSTACK REVIEW REPORT` is the last `## ` section of the plan file whenever one was written. The `{{PLAN_FILE_REVIEW_REPORT}}` resolver mandated this contract; nothing tested it until now.
-- **Seed a draft plan into a `runPlanSkillObservation` test run.** New `initialPlanContent` option in the runner pre-pumps a user message before invoking the skill, so STOP-gate regression tests have guaranteed-finding-triggering complexity (8+ files, custom-vs-builtin smell) to react to. Without this, plan mode created an empty plan and the skill had nothing to find.
 - **Catch the "writes findings to plan as prose before asking" failure mode.** New `wrote_findings_before_asking` classifier outcome fires when a `Write`/`Edit` to `.claude/plans/*` precedes any AskUserQuestion render in the session window. Opt-in via `strictPlanWrites: true` so existing tests where zero-findings → write plan → plan_ready stays legitimate.
 - **Run `plan-design-review-plan-mode` on PR CI again.** The touchfiles entry was duplicated — `plan-design-review-plan-mode` appeared at line 94 (gate, full deps) and line 243 (smaller deps). JS object literals: later wins. The effective tier was `periodic`, not `gate`. Three of four plan-mode siblings ran on every PR; design didn't.
 
@@ -49,7 +48,7 @@ same language.
 #### For contributors
 
 - 6 new classifier unit tests in `test/helpers/claude-pty-runner.unit.test.ts` (70 → 76).
-- Outside-voice review by Codex (gpt-5-codex / medium) caught three blockers in the planning stage: a duplicate weaker `planFileEndsWithReviewReport` helper proposal (rejected — reuse existing `assertReviewReportAtBottom`), the seeded-plan-invisibility issue (resolved via `initialPlanContent`), and the touchfiles duplicate-key bug (resolved here). Plan iteration tracked as D3/D4/D5 in `~/.claude/plans/system-instruction-you-are-working-fancy-aho.md`.
+- New `initialPlanContent?: string` option on `runPlanSkillObservation` for seeding a draft plan into a test run before invoking the skill. Lets STOP-gate regression tests pre-pump guaranteed-finding-triggering complexity (8+ files, custom-vs-builtin smell) so the skill has something concrete to react to.
 
 ## [1.26.0.0] - 2026-05-02
 
