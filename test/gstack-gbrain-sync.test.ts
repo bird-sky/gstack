@@ -149,6 +149,67 @@ describe("gstack-gbrain-sync CLI", () => {
     }
   });
 
+  it("derives a gbrain-valid source id when the cwd repo has NO origin remote", () => {
+    // Fallback path in deriveCodeSourceId(): no `origin` remote configured,
+    // so the slug comes from the repo basename. The fallback must still
+    // produce a gbrain-valid id (no dots, ≤32 chars, no trailing hyphen).
+    const home = makeTestHome();
+    const gstackHome = join(home, ".gstack");
+    mkdirSync(gstackHome, { recursive: true });
+    const repo = mkdtempSync(join(tmpdir(), "gstack-no-origin-"));
+    spawnSync("git", ["init", "--quiet", "-b", "main"], { cwd: repo });
+    // No `git remote add origin` — this is the no-remote case.
+
+    const r = spawnSync("bun", [SCRIPT, "--dry-run", "--code-only", "--quiet"], {
+      encoding: "utf-8",
+      timeout: 60000,
+      cwd: repo,
+      env: { ...process.env, HOME: home, GSTACK_HOME: gstackHome },
+    });
+    expect(r.status).toBe(0);
+    const m = (r.stdout || "").match(/gbrain sources add (\S+)/);
+    expect(m).not.toBeNull();
+    const id = m![1];
+    expect(id.startsWith("gstack-code-")).toBe(true);
+    expect(id.length).toBeLessThanOrEqual(32);
+    expect(id).toMatch(/^[a-z0-9](?:[a-z0-9-]{0,30}[a-z0-9])?$/);
+
+    rmSync(repo, { recursive: true, force: true });
+    rmSync(home, { recursive: true, force: true });
+  });
+
+  it("derives a gbrain-valid source id when the basename sanitizes to empty", () => {
+    // Pathological edge: a repo whose basename is all non-alnum (e.g. "___")
+    // sanitizes to an empty slug. Pre-fix, constrainSourceId returned
+    // "gstack-code-" — invalid per the gbrain validator on the trailing
+    // hyphen. Fix falls back to a deterministic hash of the original input.
+    const home = makeTestHome();
+    const gstackHome = join(home, ".gstack");
+    mkdirSync(gstackHome, { recursive: true });
+    const parent = mkdtempSync(join(tmpdir(), "gstack-empty-base-"));
+    const repo = join(parent, "___");
+    mkdirSync(repo);
+    spawnSync("git", ["init", "--quiet", "-b", "main"], { cwd: repo });
+    // No `origin` remote — forces the basename-fallback path.
+
+    const r = spawnSync("bun", [SCRIPT, "--dry-run", "--code-only", "--quiet"], {
+      encoding: "utf-8",
+      timeout: 60000,
+      cwd: repo,
+      env: { ...process.env, HOME: home, GSTACK_HOME: gstackHome },
+    });
+    expect(r.status).toBe(0);
+    const m = (r.stdout || "").match(/gbrain sources add (\S+)/);
+    expect(m).not.toBeNull();
+    const id = m![1];
+    // Expect hash-only fallback shape: gstack-code-<6 hex chars>
+    expect(id).toMatch(/^gstack-code-[0-9a-f]{6}$/);
+    expect(id.length).toBeLessThanOrEqual(32);
+
+    rmSync(parent, { recursive: true, force: true });
+    rmSync(home, { recursive: true, force: true });
+  });
+
   it("dry-run does NOT acquire the lock file (lock is for write paths only)", () => {
     const home = makeTestHome();
     const gstackHome = join(home, ".gstack");

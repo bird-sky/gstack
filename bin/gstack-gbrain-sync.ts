@@ -188,6 +188,14 @@ function deriveCodeSourceId(repoPath: string): string {
 function constrainSourceId(prefix: string, raw: string): string {
   const MAX = 32;
   const slug = raw.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "");
+  // Empty slug after sanitize (e.g. raw was all non-alnum like "___") would
+  // produce "${prefix}-" which fails gbrain's validator on the trailing
+  // hyphen. Fall back to a deterministic hash of the original input so the
+  // result is stable across runs of the same repo.
+  if (!slug) {
+    const hash = createHash("sha1").update(raw || "_empty").digest("hex").slice(0, 6);
+    return `${prefix}-${hash}`;
+  }
   const full = `${prefix}-${slug}`;
   if (full.length <= MAX) return full;
   const hash = createHash("sha1").update(slug).digest("hex").slice(0, 6);
