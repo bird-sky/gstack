@@ -297,6 +297,189 @@ export function isNumberedOptionListVisible(visible: string): boolean {
   return /❯\s*1\./.test(visible) && /(^|[^0-9])2\./.test(visible);
 }
 
+// ────────────────────────────────────────────────────────────────────────────
+// LLM judge — "is the model waiting for user input, working, or hung?"
+//
+// Regex detectors (isNumberedOptionListVisible, isProseAUQVisible) are fast
+// and deterministic but brittle to PTY rendering quirks (cursor-positioning
+// escapes that collapse multi-line option lists onto a single logical line).
+// When they miss, the polling loop times out at the full budget — even
+// though the model is correctly surfacing a question via a format the regex
+// can't reassemble.
+//
+// This LLM judge takes a TTY snapshot and answers a trichotomy:
+//   - 'waiting'  — agent surfaced a question/options, sitting at input prompt
+//   - 'working'  — agent is still generating (spinner, tool calls, "Musing")
+//   - 'hung'     — agent stopped without surfacing anything (rare)
+//
+// Used by polling loops as a fallback after N seconds with no terminal
+// classification. On 'waiting' verdict, return outcome='asked' early.
+//
+// Cost: ~$0.0005 per call using claude haiku 4.5. Cached by snapshot hash so
+// identical TTY frames don't re-charge. All verdicts logged to
+// ~/.gstack/analytics/pty-judge.jsonl for offline analysis.
+// ────────────────────────────────────────────────────────────────────────────
+
+import { spawnSync as nodeSpawnSync } from 'node:child_process';
+import { createHash } from 'node:crypto';
+
+export interface PtyStateVerdict {
+  state: 'waiting' | 'working' | 'hung' | 'unknown';
+  reasoning: string;
+  /** SHA-1 of the normalized snapshot input (for caching/dedup). */
+  hash: string;
+  /** Wall time (ms) the judge call took. */
+  elapsedMs: number;
+}
+
+const PTY_VERDICT_CACHE = new Map<string, PtyStateVerdict>();
+
+/**
+ * Persist a verdict (or snapshot dump) to the analytics JSONL log.
+ * Best-effort — failures (disk full, permission denied, etc.) are swallowed
+ * so the harness never fails on logging.
+ */
+function logPtyJudge(record: Record<string, unknown>): void {
+  try {
+    const dir = `${process.env.HOME}/.gstack/analytics`;
+    fs.mkdirSync(dir, { recursive: true });
+    fs.appendFileSync(`${dir}/pty-judge.jsonl`, JSON.stringify(record) + '\n');
+  } catch {
+    /* best-effort */
+  }
+}
+
+/**
+ * Snapshot dump for postmortem debugging when GSTACK_PTY_LOG=1.
+ * Writes the last 4KB of visible TTY plus context to
+ * ~/.gstack/analytics/pty-snapshots/<testName>-<elapsed>ms.txt.
+ */
+export function logPtySnapshot(visible: string, ctx: { testName: string; elapsedMs: number; tag?: string }): void {
+  if (process.env.GSTACK_PTY_LOG !== '1') return;
+  try {
+    const dir = `${process.env.HOME}/.gstack/analytics/pty-snapshots`;
+    fs.mkdirSync(dir, { recursive: true });
+    const tag = ctx.tag ? `-${ctx.tag}` : '';
+    const file = `${dir}/${ctx.testName}-${ctx.elapsedMs}ms${tag}.txt`;
+    fs.writeFileSync(
+      file,
+      `# testName: ${ctx.testName}\n# elapsedMs: ${ctx.elapsedMs}\n# tag: ${ctx.tag ?? ''}\n# visible.length: ${visible.length}\n\n${visible.slice(-4096)}`,
+    );
+  } catch {
+    /* best-effort */
+  }
+}
+
+/**
+ * Ask Claude Haiku 4.5 to classify a TTY snapshot as waiting/working/hung.
+ *
+ * Implementation: spawns `claude -p --model claude-haiku-4-5` synchronously
+ * with the prompt piped via stdin. Uses subscription auth (no API key env
+ * required). 30-second timeout; returns 'unknown' on any failure mode
+ * (timeout, malformed JSON, missing claude binary).
+ *
+ * Cache: identical snapshot hashes return the cached verdict without
+ * re-calling. Cache lives in-process; resets between test runs.
+ */
+export function judgePtyState(
+  visible: string,
+  ctx?: { testName?: string },
+): PtyStateVerdict {
+  // Normalize: strip trailing whitespace lines + take last 4KB. Hash the
+  // normalized form so spinner-frame-only diffs (which all look "working")
+  // don't bust the cache and rack up cost.
+  const tail = visible.slice(-4096).replace(/[ \t]+$/gm, '');
+  const hash = createHash('sha1').update(tail).digest('hex').slice(0, 16);
+
+  const cached = PTY_VERDICT_CACHE.get(hash);
+  if (cached) return cached;
+
+  const judgeStart = Date.now();
+  const prompt = `You are reading a snapshot of a terminal where Claude Code is running in plan mode for an automated test. Your job: classify the agent's current state.
+
+Pick exactly ONE:
+- WAITING — agent surfaced a question or option list and is sitting at the input prompt waiting for user reply. Signs: numbered/lettered options visible (1./2./3. or A)/B)/C)), "Recommendation:" line, cursor at empty input prompt with no recent generation activity.
+- WORKING — agent is actively generating or running tools. Signs: spinner glyphs (✻ ✶ ✳ ✢ ✽), "Musing..." or "Churned for ..." text, recent tool-call blocks (Read/Edit/Bash/Grep), in-flight token output.
+- HUNG — agent has stopped without surfacing a question and without any spinner/work activity. Rare; usually means a crash.
+
+Respond with strict JSON ONLY (no markdown fences, no prose):
+{"state":"waiting","reasoning":"one short sentence"}
+
+Terminal snapshot (last 4KB):
+\`\`\`
+${tail}
+\`\`\``;
+
+  let verdict: PtyStateVerdict = {
+    state: 'unknown',
+    reasoning: 'judge call did not complete',
+    hash,
+    elapsedMs: 0,
+  };
+
+  try {
+    const result = nodeSpawnSync(
+      'claude',
+      ['-p', '--model', 'claude-haiku-4-5', '--max-turns', '1'],
+      {
+        input: prompt,
+        stdio: ['pipe', 'pipe', 'pipe'],
+        timeout: 30_000,
+        encoding: 'utf-8',
+      },
+    );
+    const elapsedMs = Date.now() - judgeStart;
+    if (result.status === 0 && result.stdout) {
+      // Pull the first {...} JSON object out of stdout. Haiku occasionally
+      // wraps in ```json ...``` despite the prompt; tolerate that.
+      const match = result.stdout.match(/\{[\s\S]*?"state"[\s\S]*?\}/);
+      if (match) {
+        try {
+          const parsed = JSON.parse(match[0]);
+          const state = ['waiting', 'working', 'hung'].includes(parsed.state)
+            ? (parsed.state as 'waiting' | 'working' | 'hung')
+            : 'unknown';
+          verdict = {
+            state,
+            reasoning: typeof parsed.reasoning === 'string' ? parsed.reasoning.slice(0, 200) : '',
+            hash,
+            elapsedMs,
+          };
+        } catch {
+          verdict = { state: 'unknown', reasoning: 'malformed JSON', hash, elapsedMs };
+        }
+      } else {
+        verdict = { state: 'unknown', reasoning: 'no JSON in response', hash, elapsedMs };
+      }
+    } else {
+      verdict = {
+        state: 'unknown',
+        reasoning: `claude exited ${result.status} (${(result.stderr ?? '').slice(0, 80)})`,
+        hash,
+        elapsedMs,
+      };
+    }
+  } catch (err) {
+    verdict = {
+      state: 'unknown',
+      reasoning: `judge spawn failed: ${(err as Error).message}`.slice(0, 200),
+      hash,
+      elapsedMs: Date.now() - judgeStart,
+    };
+  }
+
+  PTY_VERDICT_CACHE.set(hash, verdict);
+  logPtyJudge({
+    ts: new Date().toISOString(),
+    testName: ctx?.testName ?? 'unknown',
+    state: verdict.state,
+    reasoning: verdict.reasoning,
+    hash: verdict.hash,
+    judgeMs: verdict.elapsedMs,
+  });
+  return verdict;
+}
+
 /**
  * Detect a prose-rendered AskUserQuestion in plan mode.
  *
@@ -1287,6 +1470,10 @@ export async function runPlanSkillObservation(opts: {
 
     const budgetMs = opts.timeoutMs ?? 180_000;
     const start = Date.now();
+    let lastJudgeAt = 0;
+    let lastJudgeVerdict: PtyStateVerdict | null = null;
+    const JUDGE_AFTER_MS = 60_000;
+    const JUDGE_INTERVAL_MS = 30_000;
     while (Date.now() - start < budgetMs) {
       await Bun.sleep(2000);
       const visible = session.visibleSince(since);
@@ -1327,11 +1514,35 @@ export async function runPlanSkillObservation(opts: {
         if (planFile) obs.planFile = planFile;
         return obs;
       }
+
+      // LLM judge fallback: if regex detectors didn't classify and we've
+      // burned >60s with periodic ticks, ask Haiku "is the model waiting,
+      // working, or hung?" Treat 'waiting' as 'asked' (model surfaced a
+      // question via prose the regex couldn't reassemble). Snapshot the
+      // visible buffer at each judge call when GSTACK_PTY_LOG=1.
+      const elapsed = Date.now() - start;
+      if (elapsed > JUDGE_AFTER_MS && Date.now() - lastJudgeAt > JUDGE_INTERVAL_MS) {
+        lastJudgeAt = Date.now();
+        logPtySnapshot(visible, { testName: opts.skillName, elapsedMs: elapsed, tag: 'judge-tick' });
+        lastJudgeVerdict = judgePtyState(visible, { testName: opts.skillName });
+        if (lastJudgeVerdict.state === 'waiting') {
+          return {
+            outcome: 'asked',
+            summary: `LLM judge: ${lastJudgeVerdict.reasoning} (state=waiting after ${Math.round(elapsed / 1000)}s)`,
+            evidence: visible.slice(-2000),
+            elapsedMs: Date.now() - startedAt,
+          };
+        }
+      }
     }
 
     return {
       outcome: 'timeout',
-      summary: `no terminal outcome within ${budgetMs}ms`,
+      summary:
+        `no terminal outcome within ${budgetMs}ms` +
+        (lastJudgeVerdict
+          ? ` (last LLM judge: state=${lastJudgeVerdict.state} — ${lastJudgeVerdict.reasoning})`
+          : ''),
       evidence: session.visibleSince(since).slice(-2000),
       elapsedMs: Date.now() - startedAt,
     };
@@ -1696,6 +1907,10 @@ export async function runPlanSkillFloorCheck(opts: {
     session.send(`${opts.followUpPrompt}\r`);
 
     const start = Date.now();
+    let lastJudgeAt = 0;
+    let lastJudgeVerdict: PtyStateVerdict | null = null;
+    const JUDGE_AFTER_MS = 60_000;
+    const JUDGE_INTERVAL_MS = 30_000;
     while (Date.now() - start < timeoutMs) {
       await Bun.sleep(2000);
       const visible = session.visibleSince(since);
@@ -1736,6 +1951,28 @@ export async function runPlanSkillFloorCheck(opts: {
           evidence: visible.slice(-3000),
           elapsedMs: Date.now() - startedAt,
         };
+      }
+
+      // LLM judge fallback: same shape as runPlanSkillObservation. After 60s
+      // of polling without a regex hit, ask Haiku to classify the snapshot.
+      // 'waiting' verdict counts as floor met (model surfaced a question via
+      // prose the regex couldn't catch). 'working' / 'hung' / 'unknown' don't
+      // change the outcome — they enrich the eventual timeout summary so the
+      // failure diagnostic is more actionable than "no AUQ render."
+      const elapsed = Date.now() - start;
+      if (elapsed > JUDGE_AFTER_MS && Date.now() - lastJudgeAt > JUDGE_INTERVAL_MS) {
+        lastJudgeAt = Date.now();
+        logPtySnapshot(visible, { testName: opts.skillName, elapsedMs: elapsed, tag: 'floor-judge-tick' });
+        lastJudgeVerdict = judgePtyState(visible, { testName: opts.skillName });
+        if (lastJudgeVerdict.state === 'waiting') {
+          return {
+            auqObserved: true,
+            outcome: 'auq_observed',
+            summary: `LLM judge: ${lastJudgeVerdict.reasoning} (state=waiting after ${Math.round(elapsed / 1000)}s; floor met)`,
+            evidence: visible.slice(-3000),
+            elapsedMs: Date.now() - startedAt,
+          };
+        }
       }
 
       // Silent write outside sanctioned dirs is the transcript-bug shape.
