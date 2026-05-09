@@ -23,6 +23,7 @@
 import * as fs from 'fs';
 import * as path from 'path';
 import * as crypto from 'crypto';
+import { writeSecureFile, mkdirSecure } from './file-permissions';
 import { safeUnlink } from './error-handling';
 
 const STATE_FILE = process.env.BROWSE_STATE_FILE || path.join(process.env.HOME || '/tmp', '.gstack', 'browse.json');
@@ -83,7 +84,7 @@ function findClaude(): string | null {
 /** Probe + persist claude availability for the bootstrap card. */
 function writeClaudeAvailable(): void {
   const stateDir = path.dirname(STATE_FILE);
-  try { fs.mkdirSync(stateDir, { recursive: true, mode: 0o700 }); } catch {}
+  try { mkdirSecure(stateDir); } catch {}
   const found = findClaude();
   const status = {
     available: !!found,
@@ -94,7 +95,7 @@ function writeClaudeAvailable(): void {
   const target = path.join(stateDir, 'claude-available.json');
   const tmp = path.join(stateDir, `.tmp-claude-${process.pid}`);
   try {
-    fs.writeFileSync(tmp, JSON.stringify(status, null, 2), { mode: 0o600 });
+    writeSecureFile(tmp, JSON.stringify(status, null, 2));
     fs.renameSync(tmp, target);
   } catch {
     safeUnlink(tmp);
@@ -422,7 +423,7 @@ function handleTabState(msg: {
   reason?: string;
 }): void {
   const stateDir = path.dirname(STATE_FILE);
-  try { fs.mkdirSync(stateDir, { recursive: true, mode: 0o700 }); } catch {}
+  try { mkdirSecure(stateDir); } catch {}
 
   // tabs.json — full list
   if (Array.isArray(msg.tabs)) {
@@ -442,7 +443,7 @@ function handleTabState(msg: {
     const target = path.join(stateDir, 'tabs.json');
     const tmp = path.join(stateDir, `.tmp-tabs-${process.pid}`);
     try {
-      fs.writeFileSync(tmp, JSON.stringify(payload, null, 2), { mode: 0o600 });
+      writeSecureFile(tmp, JSON.stringify(payload, null, 2));
       fs.renameSync(tmp, target);
     } catch {
       safeUnlink(tmp);
@@ -457,11 +458,11 @@ function handleTabState(msg: {
     const ctxFile = path.join(stateDir, 'active-tab.json');
     const tmp = path.join(stateDir, `.tmp-tab-${process.pid}`);
     try {
-      fs.writeFileSync(tmp, JSON.stringify({
+      writeSecureFile(tmp, JSON.stringify({
         tabId: active.tabId ?? null,
         url: active.url,
         title: active.title ?? '',
-      }), { mode: 0o600 });
+      }));
       fs.renameSync(tmp, ctxFile);
     } catch {
       safeUnlink(tmp);
@@ -477,11 +478,11 @@ function handleTabSwitch(msg: { tabId?: number; url?: string; title?: string }):
   const ctxFile = path.join(stateDir, 'active-tab.json');
   const tmp = path.join(stateDir, `.tmp-tab-${process.pid}`);
   try {
-    fs.writeFileSync(tmp, JSON.stringify({
+    writeSecureFile(tmp, JSON.stringify({
       tabId: msg.tabId ?? null,
       url,
       title: msg.title ?? '',
-    }), { mode: 0o600 });
+    }));
     fs.renameSync(tmp, ctxFile);
   } catch {
     safeUnlink(tmp);
@@ -524,9 +525,9 @@ function main() {
 
   // Write port file atomically so the parent server can pick it up.
   const dir = path.dirname(PORT_FILE);
-  try { fs.mkdirSync(dir, { recursive: true, mode: 0o700 }); } catch {}
+  try { mkdirSecure(dir); } catch {}
   const tmp = `${PORT_FILE}.tmp-${process.pid}`;
-  fs.writeFileSync(tmp, String(port), { mode: 0o600 });
+  writeSecureFile(tmp, String(port));
   fs.renameSync(tmp, PORT_FILE);
 
   // Hand the parent the internal token so it can call /internal/grant.
@@ -549,8 +550,8 @@ function main() {
 // to a state file the parent reads. This avoids env-passing races. See main().
 const INTERNAL_TOKEN_FILE = path.join(path.dirname(STATE_FILE), 'terminal-internal-token');
 try {
-  fs.mkdirSync(path.dirname(INTERNAL_TOKEN_FILE), { recursive: true, mode: 0o700 });
-  fs.writeFileSync(INTERNAL_TOKEN_FILE, INTERNAL_TOKEN, { mode: 0o600 });
+  mkdirSecure(path.dirname(INTERNAL_TOKEN_FILE));
+  writeSecureFile(INTERNAL_TOKEN_FILE, INTERNAL_TOKEN);
 } catch {}
 
 main();
