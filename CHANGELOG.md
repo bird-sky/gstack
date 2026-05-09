@@ -1,5 +1,131 @@
 # Changelog
 
+## [1.31.0.0] - 2026-05-09
+
+## **AskUserQuestion stops getting silently buried in plan files.**
+## **The forever-war contradiction in the preamble is deleted, the test harness sees prose-rendered questions, and 5 fictional test variants are gone.**
+
+After v1.31, `/plan-eng-review`, `/office-hours`, and the rest of the
+plan-* skills surface every decision through AskUserQuestion. The
+"fallback when neither variant is callable" clause that quietly
+authorized a `## Decisions to confirm` plan-write + ExitPlanMode is
+deleted, along with the "trivial fix" exception that survived the
+prior tightening and the "outside plan mode, output as prose and stop"
+escape hatch. Skill-text loses ~10 lines net across 8 inline sites
+plus the 6 places the same fallback was repeated verbatim inside
+`plan-eng-review/SKILL.md.tmpl`.
+
+Five test variants that simulated a Conductor configuration nobody
+actually runs (`--disallowedTools AskUserQuestion` without a registered
+MCP variant, i.e. "neither AUQ tool callable") are deleted. They
+tested a state that doesn't exist in production: real Conductor
+sessions register `mcp__conductor__AskUserQuestion`, so the model
+always has the MCP variant. The deleted variants were a long-running
+flake source.
+
+The harness gained three new primitives that survive the test cull:
+`isProseAUQVisible` regex detector for lettered (A/B/C/D) and numbered
+(1/2/3) prose AUQ rendering, an LLM judge using `claude-haiku-4-5`
+that classifies TTY snapshots as `waiting` / `working` / `hung`, and
+high-water-mark tracking on `PlanSkillObservation` so tests that
+check "did the user see a question at SOME point" don't have to scan
+the truncated 2KB evidence window.
+
+### The numbers that matter
+
+| Surface | Before | After | Δ |
+|---|---|---|---|
+| Fallback clause inline sites in skill-text | 8 | 0 | -8 |
+| Surviving "trivial fix" / "prose-and-stop" escape hatches | 2 | 0 | -2 |
+| Plan-mode test variants under fictional `--disallowedTools` | 5 | 0 | -5 |
+| LLM judge classifications | 0 | 4 (waiting/working/hung/unknown) | +4 |
+| Diff size on this branch (after merge with main) | — | -721 / +928 | net +207 |
+
+The deleted "fallback" clause was the load-bearing instruction the
+model was rationalizing as a general escape hatch from "fanning out
+round-trip AUQs." Once it's gone, the anti-shortcut clause and STOP
+gates in `plan-eng-review` Sections 1-4 stand without a contradicting
+instruction to lose to. `gate-tier plan-eng-finding-floor` passes on
+every run since the architectural fix landed.
+
+### What this means for builders
+
+If you are running `/plan-eng-review` or any other plan-* skill, you
+will see one AskUserQuestion per finding instead of four findings
+quietly batched into a "## Decisions to confirm" plan-file write that
+gets buried under ExitPlanMode. The harness improvements (prose-AUQ
+detector, LLM judge, snapshot logs at `~/.gstack/analytics/pty-judge.jsonl`
+and `~/.gstack/analytics/pty-snapshots/` when `GSTACK_PTY_LOG=1`) are
+load-bearing for any future plan-mode regression test that needs to
+distinguish "model is thinking" from "model is waiting for me."
+
+### Itemized changes
+
+#### Architectural fix
+- Deleted `## Decisions to confirm` fallback clause from
+  `scripts/resolvers/preamble/generate-ask-user-format.ts:12` (both
+  branches: plan-file write AND prose-and-stop)
+- Deleted same fallback clause from
+  `scripts/resolvers/preamble/generate-completion-status.ts:29`
+- Deleted fallback inline sentences from
+  `plan-eng-review/SKILL.md.tmpl` (Step 0 + Sections 1-4: 5 instances)
+  and `office-hours/SKILL.md.tmpl` (1 instance)
+- Deleted "Only skip AskUserQuestion when the decision is genuinely
+  trivial" exception from `plan-eng-review/SKILL.md.tmpl:204`
+- Replaced with single hard rule: "If no AskUserQuestion variant
+  appears in your tool list, this skill is BLOCKED. Stop, report
+  `BLOCKED — AskUserQuestion unavailable`, and wait for the user."
+- Regenerated all 47 generated SKILL.md files (default + 7 host adapters)
+
+#### Test harness primitives
+- Added `isProseAUQVisible` regex detector with line-start anchoring
+  and tail-only native-cursor gate
+  (`test/helpers/claude-pty-runner.ts`); 8 unit tests cover lettered
+  and numbered formats, threshold edges, native-cursor exclusion, and
+  mid-prose false-positive guard
+- Added `judgePtyState` LLM judge using `claude -p --model
+  claude-haiku-4-5 --max-turns 1` with subscription auth (no API key
+  env required), in-process cache by SHA-1 of normalized last-4KB
+  snapshot, JSONL log to `~/.gstack/analytics/pty-judge.jsonl`
+- Added high-water-mark flags `proseAUQEverObserved` and
+  `waitingEverObserved` to `PlanSkillObservation`; tests check these
+  rather than re-running detectors against the truncated evidence
+  window
+- Added snapshot logging via `GSTACK_PTY_LOG=1`, dumping last 4KB of
+  visible TTY at every judge tick to
+  `~/.gstack/analytics/pty-snapshots/<test>-<elapsed>ms.txt`
+- `assertReportAtBottomIfPlanWritten` now tolerates ENOENT (TTY-detected
+  path that didn't persist) and `outcome='asked'` smoke runs (workflow
+  exited at first AUQ, no review report yet)
+- Wired LLM judge fallback into `runPlanSkillObservation` and
+  `runPlanSkillFloorCheck` polling loops: after 60s of no terminal
+  classification, snapshot every 30s and call the judge; on `waiting`
+  verdict, return `outcome='asked'` early
+
+#### Test surface changes
+- Added `test/skill-e2e-plan-eng-multi-finding-batching.test.ts`
+  (periodic tier) using `runPlanSkillCounting` with a 4-finding seeded
+  fixture (`FORCING_BATCHING_ENG`) that mirrors the original transcript
+  bug shape; asserts at least 3 distinct review-phase AUQs
+- Deleted `test/skill-e2e-autoplan-auto-mode.test.ts` entirely
+- Deleted test 2 (`--disallowedTools AskUserQuestion`) from
+  `plan-ceo-plan-mode`, `plan-design-plan-mode`, `plan-eng-plan-mode`
+  (kept test 1 baseline plus plan-eng-plan-mode test 3 STOP-gate)
+- Removed `autoplan-auto-mode` entry from `test/helpers/touchfiles.ts`
+  (E2E_TOUCHFILES and E2E_TIERS); updated `test/touchfiles.test.ts`
+  assertion count
+
+#### For contributors
+- Three subagent investigations across the debugging cycle were the
+  load-bearing diagnostic step: the architectural fix, the prose-AUQ
+  detector design, and the test-fictional-state retraction. The
+  pattern that worked: have a fresh-context subagent verify the
+  parent's mental model against actual file contents before committing
+  to a fix. Codex review caught that "three places" was actually
+  eight, that the proposed multi-finding test would pass trivially
+  given how `runPlanSkillFloorCheck` exits on first AUQ, and that
+  three existing tests codified the deleted fallback as PASS.
+
 ## [1.29.0.0] - 2026-05-08
 
 ## **Code search beats Grep across every Conductor worktree now, not just the last one you synced.**
