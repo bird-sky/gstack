@@ -11,8 +11,10 @@
  */
 
 import * as fs from 'fs';
+import * as os from 'os';
 import * as path from 'path';
 import { mkdirSecure } from './file-permissions';
+import { safeUnlinkQuiet } from './error-handling';
 
 export interface BrowseConfig {
   projectDir: string;
@@ -149,5 +151,59 @@ export function readVersionHash(execPath: string = process.execPath): string | n
     return fs.readFileSync(versionFile, 'utf-8').trim() || null;
   } catch {
     return null;
+  }
+}
+
+/**
+ * Resolve the gstack home directory.
+ *
+ * Honors the existing convention used by telemetry.ts and domain-skills.ts:
+ *   1. GSTACK_HOME env (explicit override)
+ *   2. $HOME/.gstack (default)
+ */
+export function resolveGstackHome(): string {
+  return process.env.GSTACK_HOME || path.join(os.homedir(), '.gstack');
+}
+
+/**
+ * Resolve the Chromium profile directory.
+ *
+ * Resolution order:
+ *   1. `explicit` arg (passed via ServerConfig.chromiumProfile by embedders)
+ *   2. CHROMIUM_PROFILE env (used by gbrowser's gbd per-workspace)
+ *   3. <resolveGstackHome()>/chromium-profile (default)
+ */
+export function resolveChromiumProfile(explicit?: string): string {
+  if (explicit && explicit.length > 0) return explicit;
+  const env = process.env.CHROMIUM_PROFILE;
+  if (env && env.length > 0) return env;
+  return path.join(resolveGstackHome(), 'chromium-profile');
+}
+
+/**
+ * Pre-launch / shutdown cleanup of stale Chromium singleton lockfiles
+ * (SingletonLock, SingletonSocket, SingletonCookie). Chromium's
+ * ProcessSingleton refuses to start when these exist from a prior crash
+ * (SIGKILL, hard crash, etc.) since they point at a PID that no longer exists.
+ *
+ * Defensive guard: refuses to operate unless the directory basename is
+ * 'chromium-profile' OR the path matches the explicit CHROMIUM_PROFILE env
+ * value. Prevents accidentally deleting lock files from an unrelated
+ * directory if profile resolution is misconfigured upstream.
+ *
+ * Caller MUST ensure external coordination has already guaranteed no live
+ * peer is using this profile (gbd.lock for gbrowser; single-instance CLI
+ * check for gstack).
+ */
+export function cleanSingletonLocks(userDataDir: string): void {
+  const basename = path.basename(userDataDir);
+  const explicitProfile = process.env.CHROMIUM_PROFILE;
+  const isSafe = basename === 'chromium-profile' || userDataDir === explicitProfile;
+  if (!isSafe) {
+    console.warn(`[browse] cleanSingletonLocks: refusing to clean unrecognized profile dir: ${userDataDir}`);
+    return;
+  }
+  for (const lockFile of ['SingletonLock', 'SingletonSocket', 'SingletonCookie']) {
+    safeUnlinkQuiet(path.join(userDataDir, lockFile));
   }
 }
