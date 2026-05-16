@@ -64,6 +64,7 @@ import {
   detectEngineTier,
   withErrorContext,
 } from "../lib/gstack-memory-helpers";
+import { execGbrainText, spawnGbrainAsync } from "../lib/gbrain-exec";
 
 // ── Types ──────────────────────────────────────────────────────────────────
 
@@ -813,11 +814,10 @@ function gbrainAvailable(): boolean {
     // `import <dir>` (batch markdown import via path-authoritative slugs).
     // If absent, we surface a single clean error here rather than failing
     // the whole stage with a confusing usage message from gbrain itself.
-    const help = execFileSync("gbrain", ["--help"], {
-      encoding: "utf-8",
-      timeout: 5000,
-      stdio: ["ignore", "pipe", "pipe"],
-    });
+    // `gbrain --help` probes only CLI availability, not DB connectivity, so
+    // it doesn't strictly need DATABASE_URL. But routing through the helper
+    // keeps the invariant test from chasing exceptions per call site.
+    const help = execGbrainText(["--help"], { timeout: 5000 });
     _gbrainAvailability = /^\s+import\s/m.test(help);
   } catch {
     _gbrainAvailability = false;
@@ -1316,11 +1316,11 @@ function runGbrainImport(
 ): Promise<{ status: number | null; stdout: string; stderr: string }> {
   installSignalForwarder();
   return new Promise((resolve) => {
-    const child = spawn(
-      "gbrain",
-      ["import", stagingDir, "--no-embed", "--json"],
-      { stdio: ["ignore", "pipe", "pipe"] },
-    );
+    // Seed DATABASE_URL from gbrain's own config so this stage works
+    // inside Next.js / Prisma / Rails projects with their own
+    // .env.local (codex review #7 — defense in depth on top of the
+    // parent gstack-gbrain-sync seeding the bun grandchild's env).
+    const child = spawnGbrainAsync(["import", stagingDir, "--no-embed", "--json"]);
     _activeImportChild = child;
     let stdout = "";
     let stderr = "";

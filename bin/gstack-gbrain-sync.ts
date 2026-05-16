@@ -39,6 +39,7 @@ import "../lib/conductor-env-shim";
 import { detectEngineTier, withErrorContext, canonicalizeRemote } from "../lib/gstack-memory-helpers";
 import { ensureSourceRegistered, sourcePageCount } from "../lib/gbrain-sources";
 import { localEngineStatus, type LocalEngineStatus } from "../lib/gbrain-local-status";
+import { buildGbrainEnv, spawnGbrain, execGbrainJson } from "../lib/gbrain-exec";
 
 // ── Types ──────────────────────────────────────────────────────────────────
 
@@ -262,11 +263,9 @@ export function _resetGbrainSupportsRenameCache(): void {
 function gbrainSupportsSourcesRename(env?: NodeJS.ProcessEnv): boolean {
   if (_gbrainSupportsRenameCache !== null) return _gbrainSupportsRenameCache;
   try {
-    const r = spawnSync("gbrain", ["sources", "rename", "--help"], {
-      encoding: "utf-8",
+    const r = spawnGbrain(["sources", "rename", "--help"], {
       timeout: 5_000,
-      stdio: ["ignore", "pipe", "pipe"],
-      env: env || process.env,
+      baseEnv: env,
     });
     const out = `${r.stdout || ""}\n${r.stderr || ""}`;
     // Match the exact argument shape: `rename <old> <new>` (with literal
@@ -290,20 +289,13 @@ function gbrainSupportsSourcesRename(env?: NodeJS.ProcessEnv): boolean {
  * helper can be exercised without a real gbrain CLI.
  */
 export function sourceLocalPath(sourceId: string, env?: NodeJS.ProcessEnv): string | null {
-  try {
-    const r = spawnSync("gbrain", ["sources", "list", "--json"], {
-      encoding: "utf-8",
-      timeout: 30_000,
-      stdio: ["ignore", "pipe", "pipe"],
-      env: env || process.env,
-    });
-    if (r.status !== 0) return null;
-    const list = JSON.parse(r.stdout || "[]") as Array<{ id: string; local_path?: string }>;
-    const found = list.find((s) => s.id === sourceId);
-    return found?.local_path ?? null;
-  } catch {
-    return null;
-  }
+  const list = execGbrainJson<Array<{ id: string; local_path?: string }>>(
+    ["sources", "list", "--json"],
+    { baseEnv: env },
+  );
+  if (!list) return null;
+  const found = list.find((s) => s.id === sourceId);
+  return found?.local_path ?? null;
 }
 
 /** Result of `planHostnameFoldMigration` — informs `runCodeImport` of next steps. */
@@ -352,12 +344,7 @@ export function planHostnameFoldMigration(
     };
   }
   if (gbrainSupportsSourcesRename(env)) {
-    const r = spawnSync("gbrain", ["sources", "rename", legacyPathHashId, newSourceId], {
-      encoding: "utf-8",
-      timeout: 30_000,
-      stdio: ["ignore", "pipe", "pipe"],
-      env: env || process.env,
-    });
+    const r = spawnGbrain(["sources", "rename", legacyPathHashId, newSourceId], { baseEnv: env });
     if (r.status === 0) {
       return { kind: "renamed", oldId: legacyPathHashId, newId: newSourceId };
     }
@@ -377,12 +364,8 @@ export function planHostnameFoldMigration(
  * flag-helper centralization in commit 4 (lib/gbrain-exec.ts) will resolve
  * the inconsistency across the codebase.
  */
-export function removeOrphanedSource(oldId: string): boolean {
-  const r = spawnSync("gbrain", ["sources", "remove", oldId, "--confirm-destructive"], {
-    encoding: "utf-8",
-    timeout: 30_000,
-    stdio: ["ignore", "pipe", "pipe"],
-  });
+export function removeOrphanedSource(oldId: string, env?: NodeJS.ProcessEnv): boolean {
+  const r = spawnGbrain(["sources", "remove", oldId, "--confirm-destructive"], { baseEnv: env });
   return r.status === 0;
 }
 
@@ -555,13 +538,16 @@ async function runCodeImport(args: CliArgs): Promise<StageResult> {
   // hits forever if we left the orphan in place. Remove the legacy id once
   // here so users don't accumulate orphans.
   // Failure is non-fatal — we still register the new id below.
+  // gbrainEnv seeds DATABASE_URL from gbrain's config so this stage works
+  // inside Next.js / Prisma / Rails projects with their own .env.local
+  // (codex review #7 — bug fix is wider than #1508 as filed).
+  const gbrainEnv = buildGbrainEnv({ announce: !args.quiet });
   const legacyId = deriveLegacyCodeSourceId(root);
   let legacyRemoved = false;
   if (legacyId !== sourceId) {
-    const rm = spawnSync("gbrain", ["sources", "remove", legacyId, "--confirm-destructive"], {
-      encoding: "utf-8",
+    const rm = spawnGbrain(["sources", "remove", legacyId, "--confirm-destructive"], {
       timeout: 30_000,
-      stdio: ["ignore", "pipe", "pipe"],
+      baseEnv: gbrainEnv,
     });
     // Treat absent-source as success (clean state). gbrain emits "not found" on
     // missing id; treat any non-zero exit without "not found" as a soft fail.
@@ -575,7 +561,7 @@ async function runCodeImport(args: CliArgs): Promise<StageResult> {
   // pages); fall back to register-new → sync-OK → remove-old. Path-drift
   // (user moved the repo, etc.) skips migration with a warning.
   const pathOnlyHashLegacyId = derivePathOnlyHashLegacyId(root);
-  const migration = planHostnameFoldMigration(root, sourceId, pathOnlyHashLegacyId);
+  const migration = planHostnameFoldMigration(root, sourceId, pathOnlyHashLegacyId, gbrainEnv);
   if (migration.kind === "skipped-path-drift" && !args.quiet) {
     console.error(
       `[sync:code] hostname-fold migration skipped: legacy source ${migration.oldId} `
@@ -590,7 +576,7 @@ async function runCodeImport(args: CliArgs): Promise<StageResult> {
   // no synchronous duplicate here (per /codex review #12).
   let registered = false;
   try {
-    const result = await ensureSourceRegistered(sourceId, root, { federated: true });
+    const result = await ensureSourceRegistered(sourceId, root, { federated: true, env: gbrainEnv });
     registered = result.changed;
   } catch (err) {
     return {
@@ -608,9 +594,10 @@ async function runCodeImport(args: CliArgs): Promise<StageResult> {
     ? ["reindex-code", "--source", sourceId, "--yes"]
     : ["sync", "--strategy", "code", "--source", sourceId];
 
-  const syncResult = spawnSync("gbrain", syncArgs, {
+  const syncResult = spawnGbrain(syncArgs, {
     stdio: args.quiet ? ["ignore", "ignore", "ignore"] : ["ignore", "inherit", "inherit"],
     timeout: 35 * 60 * 1000,
+    baseEnv: gbrainEnv,
   });
 
   if (syncResult.status !== 0) {
@@ -633,13 +620,12 @@ async function runCodeImport(args: CliArgs): Promise<StageResult> {
   // the wrong/default source. Treat it as a stage failure (ok=false) so the
   // verdict block surfaces ERR and the user knows to retry rather than
   // trusting stale results.
-  const attach = spawnSync("gbrain", ["sources", "attach", sourceId], {
-    encoding: "utf-8",
+  const attach = spawnGbrain(["sources", "attach", sourceId], {
     timeout: 10_000,
     cwd: root,
-    stdio: ["ignore", "pipe", "pipe"],
+    baseEnv: gbrainEnv,
   });
-  const pageCount = sourcePageCount(sourceId);
+  const pageCount = sourcePageCount(sourceId, gbrainEnv);
 
   // Step 4: Deferred hostname-fold cleanup.
   // Only remove the pre-#1468 path-only-hash source NOW that the new source
@@ -649,7 +635,7 @@ async function runCodeImport(args: CliArgs): Promise<StageResult> {
   // safety: register → sync → verify → THEN delete.
   let hostnameLegacyRemoved = false;
   if (migration.kind === "pending-cleanup" && pageCount !== null && pageCount > 0) {
-    hostnameLegacyRemoved = removeOrphanedSource(migration.oldId);
+    hostnameLegacyRemoved = removeOrphanedSource(migration.oldId, gbrainEnv);
     if (hostnameLegacyRemoved && !args.quiet) {
       console.error(`[sync:code] hostname-fold migration: removed legacy ${migration.oldId} after new source sync verified (page_count=${pageCount})`);
     }
@@ -718,9 +704,14 @@ function runMemoryIngest(args: CliArgs): StageResult {
   else ingestArgs.push("--incremental");
   if (args.quiet) ingestArgs.push("--quiet");
 
+  // Thread the seeded env into the bun grandchild (codex review #7 — the
+  // .env.local footgun affects gstack-memory-ingest.ts too, not just the
+  // direct gbrain spawns in this file). The grandchild calls gbrain import
+  // internally and must see the DATABASE_URL from gbrain's own config.
   const result = spawnSync("bun", ingestArgs, {
     encoding: "utf-8",
     timeout: 35 * 60 * 1000,
+    env: buildGbrainEnv({ announce: false }),
   });
 
   // D6: parse [memory-ingest] lines from the child's stderr. ERR-prefixed
