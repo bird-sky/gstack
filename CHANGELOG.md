@@ -1,5 +1,47 @@
 # Changelog
 
+## [1.42.1.0] - 2026-05-19
+
+## **Embedder PTY teardown stops clobbering — gbrowser's phoenix overlay survives every shutdown.**
+## **`buildFetchHandler` gains an explicit ownership flag for terminal-agent files; CLI behavior preserved bit-for-bit.**
+
+`browse/src/server.ts` factory shutdown unconditionally killed the terminal-agent and unlinked its discovery files on every teardown. Correct for gstack's CLI path, wrong for embedders that pass their own pre-launched `BrowserManager` and run their own PTY server. Their `terminal-port` file got clobbered every cycle, `/health.terminalPort` reported null until the overlay rewrote it. gbrowser's phoenix overlay shipped a client-side mitigation; with this PR landed, that mitigation becomes redundant. The new `ServerConfig.ownsTerminalAgent?: boolean` (default `true`) gates the three teardown side effects together: `pkill -f terminal-agent\.ts`, `safeUnlinkQuiet(<stateDir>/terminal-port)`, `safeUnlinkQuiet(<stateDir>/terminal-internal-token)`. Embedders pass `false` to keep their PTY lifecycle intact.
+
+### The numbers that matter
+
+Source: `bun test browse/test/server-embedder-terminal-port.test.ts browse/test/server-factory.test.ts` — 32 tests, all green. Static-grep test pins the CLI `start()` call site so a refactor that drops the explicit `: true` fails CI.
+
+| Surface | Before | After |
+|---|---|---|
+| gbrowser phoenix overlay teardown | `terminal-port` unlinked every cycle; `/health.terminalPort: null` until overlay rewrites; client-side mitigation required | Pass `ownsTerminalAgent: false` — files untouched, embedder owns full lifecycle |
+| gstack CLI shutdown | `pkill` + 2 unlinks fire | Identical (default `true`, explicit `: true` at `start()` call site documents intent + static-grep test) |
+| Test runner safety | n/a | `spawnSync` stubbed in all 4 cases so real `pkill -f terminal-agent\.ts` cannot run on developer machine |
+| Multi-case shutdown tests | Module-scoped `isShuttingDown` silently no-ops 2nd shutdown | New `__resetShuttingDown` test-only export mirrors `__resetRegistry` precedent |
+| Real-daemon collision risk | Test mutates `~/.gstack/.../terminal-port` — would clobber a running developer daemon | `beforeAll` saves real contents, `afterAll` restores; tests safe to run while gstack is alive |
+
+### What this means for builders
+
+If you embed gstack's `buildFetchHandler` and run your own PTY server, pass `ownsTerminalAgent: false` in your cfg and your `terminal-port`/`terminal-internal-token` files survive every gstack teardown — no more client-side rewrite mitigation. If you use the gstack CLI, nothing changes. The flag is the third caller-owned teardown gate in `ServerConfig` (joining `xvfb?` and `proxyBridge?`); if a fourth appears we collapse to an ownership object.
+
+### Itemized changes
+
+**Added**
+- `ServerConfig.ownsTerminalAgent?: boolean` in `browse/src/server.ts` (default `true`). JSDoc enumerates all three gated side effects, the pkill regex breadth caveat, and the polarity inversion vs `xvfb?`/`proxyBridge?` (which gate by *presence* of caller-owned handles)
+- `__resetShuttingDown()` test-only export in `browse/src/server.ts`, mirroring `__resetRegistry` precedent in `token-registry.ts`. JSDoc warns about production-import footgun
+- `browse/test/server-embedder-terminal-port.test.ts` (4 tests): `ownsTerminalAgent: false` preserves files + skips pkill, explicit `true` deletes + invokes pkill, unset defaults to `true`, static-grep test asserts CLI call site documents intent. Tests save+restore real-daemon `terminal-port`/`terminal-internal-token` contents in `beforeAll`/`afterAll` so a running developer session is never clobbered
+
+**Changed**
+- `buildFetchHandler` JSDoc references the new field alongside `beforeRoute` and `browserManager` in the embedder-composition paragraph
+- CLI `start()` call site explicitly passes `ownsTerminalAgent: true` with a comment pointing at `cli.ts:1037-1063`. Documents intent + caught by the new static-grep test if a refactor drops it
+- Strict opt-out semantics: `cfg.ownsTerminalAgent === false ? false : true` — only explicit `false` flips the gate. Defends against JS callers bypassing TS and passing truthy non-bool values
+
+**Removed**
+- Dead `try { safeUnlinkQuiet(...) } catch {}` wrappers inside the new gate. `safeUnlinkQuiet` already swallows all errors internally; the outer try/catch was slop-scan flagged dead code
+
+**For contributors**
+- Followup TODOs filed in `TODOS.md`: identity-based terminal-agent kill (replace `pkill -f` with PID-tracked `process.kill`), the pre-existing `shutdown()` reads module-level `config` (composition gap with parallel `chromiumProfile` gap), and the 4th-gate-collapse-to-ownership-object trigger
+- Plan + reviews under `~/.gstack/projects/garrytan-gstack/`: autoplan CEO + Eng dual voices (Codex + Claude subagent), interactive `/plan-eng-review` (D3: drop dead try/catch), `/ship` adversarial pass (strict-bool + JSDoc hardening + test save/restore)
+
 ## [1.42.0.0] - 2026-05-19
 
 ## **Daegu wave: 23 community-filed bugs land as one bisect-clean PR with the documented sidebar security stack finally enforced.**
