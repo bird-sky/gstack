@@ -41,9 +41,31 @@ const INTERNAL_TOKEN = crypto.randomBytes(32).toString('base64url'); // shared w
  */
 const CURRENT_GEN = crypto.randomBytes(16).toString('base64url');
 
-// In-memory cookie token registry. Parent posts /internal/grant after
-// /pty-session; we validate WS cookies against this set.
-const validTokens = new Set<string>();
+// In-memory attach-token registry. Parent posts /internal/grant after
+// /pty-session; we validate WS upgrades against this map.
+//
+// v1.44+: each token is bound to a v1.44 sessionId (the stable, non-secret
+// identifier from browse/src/pty-session-lease.ts). The token grants ONE
+// attach for ONE session — re-attach within the lease window comes through
+// /pty-session/reattach, which mints a fresh token for the same sessionId.
+//
+// Legacy callers can still pass `{token}` without sessionId (the value
+// stays null and the WS upgrade still works); those callers don't get
+// re-attach because there's no stable identifier to match against.
+const validTokens = new Map<string, string | null>(); // token → sessionId
+
+/**
+ * Reverse index for re-attach lookups: sessionId → live PtySession.
+ * Populated when a WS first attaches with a known sessionId; cleared when
+ * the session is disposed or the lease expires. Used by:
+ *   - /ws upgrade: if the incoming attachToken maps to a sessionId that
+ *     already has a live session, REPLACE its ws ref instead of spawning.
+ *   - /internal/restart: enumerate by sessionId, dispose that one session.
+ *
+ * Kept separate from the WeakMap<ws,PtySession> so re-attach can find the
+ * session by id even after the original ws has gone.
+ */
+const sessionsById = new Map<string, PtySession>();
 
 // Active PTY session per WS. One terminal per connection. Codex finding #4:
 // uncaught handlers below catch bugs in framing/cleanup so they don't kill
@@ -60,6 +82,12 @@ interface PtySession {
   cols: number;
   rows: number;
   cookie: string;
+  /**
+   * v1.44+ stable session identifier (from pty-session-lease). Null for
+   * legacy /internal/grant callers that didn't pass one. Used for
+   * targeted /internal/restart and (in Commit 3) re-attach lookups.
+   */
+  sessionId: string | null;
   spawned: boolean;
   /**
    * 25s server-side WS keepalive interval (v1.44+). Set in the WS `open`
@@ -285,6 +313,56 @@ async function internalHandler<T>(
   }
 }
 
+/**
+ * Spawn the claude PTY for a session if it hasn't been spawned yet.
+ * Used by both the legacy binary-frame spawn trigger and the v1.44 explicit
+ * `{type:"start"}` text-frame trigger. Idempotent on `session.spawned`.
+ *
+ * Returns true if claude is now running, false if spawn failed (e.g. claude
+ * binary not on PATH). On failure, the caller is expected to have already
+ * surfaced the error to the client (or will via the next frame).
+ */
+function maybeSpawnPty(ws: any, session: PtySession): boolean {
+  if (session.spawned) return true;
+  session.spawned = true;
+  let leftover = Buffer.alloc(0);
+  const proc = spawnClaude(session.cols, session.rows, (chunk) => {
+    const combined = Buffer.concat([leftover, Buffer.from(chunk)]);
+    // UTF-8 boundary detection (issue #1272). Look back at most 3 bytes
+    // for the start of an incomplete multibyte sequence and defer it.
+    let safeEnd = combined.length;
+    for (let i = combined.length - 1; i >= Math.max(0, combined.length - 3); i--) {
+      const b = combined[i];
+      if ((b & 0x80) === 0) { safeEnd = i + 1; break; }
+      if ((b & 0xC0) === 0x80) continue;
+      const expected = (b & 0xE0) === 0xC0 ? 2 : (b & 0xF0) === 0xE0 ? 3 : 4;
+      safeEnd = (combined.length - i >= expected) ? combined.length : i;
+      break;
+    }
+    const flush = combined.slice(0, safeEnd);
+    leftover = combined.slice(safeEnd);
+    if (flush.length) {
+      try { ws.sendBinary(flush); } catch {}
+    }
+  });
+  if (!proc) {
+    try {
+      ws.send(JSON.stringify({
+        type: 'error',
+        code: 'CLAUDE_NOT_FOUND',
+        message: 'claude CLI not on PATH. Install: https://docs.anthropic.com/en/docs/claude-code',
+      }));
+      ws.close(4404, 'claude not found');
+    } catch {}
+    return false;
+  }
+  session.proc = proc;
+  proc.exited?.then?.(() => {
+    try { ws.close(1000, 'pty exited'); } catch {}
+  });
+  return true;
+}
+
 function buildServer() {
   return Bun.serve({
     hostname: '127.0.0.1',
@@ -295,10 +373,18 @@ function buildServer() {
       const url = new URL(req.url);
 
       // /internal/grant — loopback-only handshake from parent server.
+      // v1.44+: accepts `{token, sessionId?}`. The sessionId binding lets
+      // the agent route re-attach attempts (same sessionId, fresh token)
+      // back to the same PtySession. Legacy callers passing just `{token}`
+      // still work — sessionId becomes null and re-attach is unavailable
+      // for that grant.
       if (url.pathname === '/internal/grant' && req.method === 'POST') {
         return internalHandler(req, (body) => {
           if (typeof body?.token === 'string' && body.token.length > 16) {
-            validTokens.add(body.token);
+            const sid = typeof body?.sessionId === 'string' && body.sessionId.length > 0
+              ? body.sessionId
+              : null;
+            validTokens.set(body.token, sid);
           }
         });
       }
@@ -307,6 +393,24 @@ function buildServer() {
       if (url.pathname === '/internal/revoke' && req.method === 'POST') {
         return internalHandler(req, (body) => {
           if (typeof body?.token === 'string') validTokens.delete(body.token);
+        });
+      }
+
+      // /internal/restart — dispose the PtySession for a specific sessionId.
+      // Scoped to one caller (not enumerate-all). Server.ts /pty-restart
+      // posts here with the caller's sessionId; we kill ONLY that PTY,
+      // leaving any other live sidebar tabs untouched. Codex T2 of the
+      // eng review caught this gap — pre-spec the route would have
+      // disposed all sessions.
+      if (url.pathname === '/internal/restart' && req.method === 'POST') {
+        return internalHandler(req, (body) => {
+          const sid = typeof body?.sessionId === 'string' ? body.sessionId : null;
+          if (!sid) return { killed: 0 };
+          const session = sessionsById.get(sid);
+          if (!session) return { killed: 0 };
+          disposeSession(session);
+          sessionsById.delete(sid);
+          return { killed: 1 };
         });
       }
 
@@ -394,8 +498,13 @@ function buildServer() {
           return new Response('unauthorized', { status: 401 });
         }
 
+        // v1.44+: surface the token's sessionId binding to the upgraded ws.
+        // open() reads it via ws.data and registers the session in
+        // sessionsById so /internal/restart and (Commit 3) re-attach
+        // lookups can find it.
+        const sessionId = validTokens.get(token) ?? null;
         const upgraded = server.upgrade(req, {
-          data: { cookie: token },
+          data: { cookie: token, sessionId },
           // Echo the protocol back so the browser accepts the upgrade.
           // Required when the client sends Sec-WebSocket-Protocol — the
           // server MUST select one of the offered protocols, otherwise
@@ -410,17 +519,21 @@ function buildServer() {
 
     websocket: {
       /**
-       * Start the 25s server-side keepalive ping. Stored on the session so
-       * close() can clear it. We construct the PtySession here (not lazily
-       * in message()) so the ping interval has somewhere to live before any
-       * data flows. Lazy claude spawn still happens on first binary frame.
+       * Spawn the claude PTY for `session` if it hasn't been spawned yet.
+       * Called from both message paths: the legacy binary-frame trigger
+       * (any keystroke) AND the v1.44 explicit `{type:"start"}` trigger
+       * (forceRestart sends this on every fresh WS to get an eager prompt
+       * without requiring the user to type). Idempotent — a second call
+       * after `spawned: true` is a no-op.
        */
       open(ws) {
+        const sessionId = (ws.data as any)?.sessionId ?? null;
         const session: PtySession = {
           proc: null,
           cols: 80,
           rows: 24,
           cookie: (ws.data as any)?.cookie || '',
+          sessionId,
           spawned: false,
           pingInterval: null,
         };
@@ -432,6 +545,8 @@ function buildServer() {
           }
         }, KEEPALIVE_INTERVAL_MS);
         sessions.set(ws, session);
+        // Index by sessionId for /internal/restart + (Commit 3) re-attach.
+        if (sessionId) sessionsById.set(sessionId, session);
       },
 
       message(ws, raw) {
@@ -445,10 +560,12 @@ function buildServer() {
             cols: 80,
             rows: 24,
             cookie: (ws.data as any)?.cookie || '',
+            sessionId: (ws.data as any)?.sessionId ?? null,
             spawned: false,
             pingInterval: null,
           };
           sessions.set(ws, session);
+          if (session.sessionId) sessionsById.set(session.sessionId, session);
         }
 
         // Text frames are control messages: {type: "resize", cols, rows},
@@ -482,50 +599,24 @@ function buildServer() {
             // future agent peer) mirrors our server-side ping shape.
             return;
           }
+          if (msg?.type === 'start') {
+            // v1.44 explicit spawn trigger. forceRestart sends this
+            // immediately on every fresh WS so claude boots without the
+            // user having to type a keystroke (pre-v1.44, the lazy-binary
+            // spawn made restart look stuck until the user typed). No-op
+            // if already spawned.
+            maybeSpawnPty(ws, session);
+            return;
+          }
           // Unknown text frame — ignore.
           return;
         }
 
-        // Binary input. Lazy-spawn claude on the first byte.
+        // Binary input. Lazy-spawn claude on the first byte if `start`
+        // wasn't sent first. Both paths land in the same maybeSpawnPty
+        // helper for behavior parity.
         if (!session.spawned) {
-          session.spawned = true;
-          // UTF-8 boundary detection to prevent splitting multi-byte characters (issue #1272).
-          // Buffer incomplete UTF-8 sequences until the next chunk completes them.
-          let leftover = Buffer.alloc(0);
-          const proc = spawnClaude(session.cols, session.rows, (chunk) => {
-            const combined = Buffer.concat([leftover, Buffer.from(chunk)]);
-            // Find the last index where a UTF-8 codepoint ends. Look back at most 3 bytes.
-            let safeEnd = combined.length;
-            for (let i = combined.length - 1; i >= Math.max(0, combined.length - 3); i--) {
-              const b = combined[i];
-              if ((b & 0x80) === 0) { safeEnd = i + 1; break; }              // ASCII
-              if ((b & 0xC0) === 0x80) continue;                             // continuation byte
-              const expected = (b & 0xE0) === 0xC0 ? 2 : (b & 0xF0) === 0xE0 ? 3 : 4;
-              safeEnd = (combined.length - i >= expected) ? combined.length : i;
-              break;
-            }
-            const flush = combined.slice(0, safeEnd);
-            leftover = combined.slice(safeEnd);
-            if (flush.length) {
-              try { ws.sendBinary(flush); } catch {}
-            }
-          });
-          if (!proc) {
-            try {
-              ws.send(JSON.stringify({
-                type: 'error',
-                code: 'CLAUDE_NOT_FOUND',
-                message: 'claude CLI not on PATH. Install: https://docs.anthropic.com/en/docs/claude-code',
-              }));
-              ws.close(4404, 'claude not found');
-            } catch {}
-            return;
-          }
-          session.proc = proc;
-          // Watch for child exit so the WS closes cleanly when claude exits.
-          proc.exited?.then?.(() => {
-            try { ws.close(1000, 'pty exited'); } catch {}
-          });
+          if (!maybeSpawnPty(ws, session)) return;
         }
         try {
           // raw is a Uint8Array; Bun.Terminal.write accepts string|Buffer.
@@ -548,6 +639,10 @@ function buildServer() {
             // Drop the cookie so it can't be replayed against a new PTY.
             validTokens.delete(session.cookie);
           }
+          // Drop the sessionId index too (Commit 3 will revisit this for
+          // re-attach where we WANT the session to outlive the original ws
+          // for the 60s detach window; for now, close = full dispose).
+          if (session.sessionId) sessionsById.delete(session.sessionId);
           sessions.delete(ws);
         }
       },
