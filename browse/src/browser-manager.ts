@@ -1710,23 +1710,38 @@ export class BrowserManager {
       }
     });
 
-    // Capture response sizes via response finished
+    // Capture response sizes via requestfinished — but DO NOT call
+    // response.body() here. Pre-fix, this listener materialized every
+    // response body across CDP just to read .length: multi-GB/hour of
+    // Buffer churn on long-lived headed Chromium with media-heavy
+    // pages, the primary Bun-side accelerant on the gbrowser-OOM
+    // investigation. req.sizes() pulls from the Network.loadingFinished
+    // event Chromium already emits — accurate for chunked transfer,
+    // gzip-compressed responses, and streaming media, all the cases
+    // where the previous Content-Length-header approach would have
+    // missed the size.
+    //
+    // The "single context-level CDP listener" architecture (D10's
+    // stretch goal — would reduce per-page listener count from N to 1
+    // via Target.setAutoAttach) is deferred. TODOS.md tracks it.
     page.on('requestfinished', async (req) => {
       try {
-        const res = await req.response();
-        if (res) {
-          const url = req.url();
-          const body = await res.body().catch(() => null);
-          const size = body ? body.length : 0;
-          for (let i = networkBuffer.length - 1; i >= 0; i--) {
-            const entry = networkBuffer.get(i);
-            if (entry && entry.url === url && !entry.size) {
-              networkBuffer.set(i, { ...entry, size });
-              break;
-            }
+        const sizes = await req.sizes().catch(() => null);
+        if (!sizes) return;
+        const url = req.url();
+        const size = sizes.responseBodySize ?? 0;
+        for (let i = networkBuffer.length - 1; i >= 0; i--) {
+          const entry = networkBuffer.get(i);
+          if (entry && entry.url === url && !entry.size) {
+            networkBuffer.set(i, { ...entry, size });
+            break;
           }
         }
-      } catch {}
+      } catch {
+        // Best-effort: requestfinished fires for aborted/cached requests too,
+        // where sizes() is unavailable. Missing size is acceptable; an
+        // unbounded throw would noise the console for every cache hit.
+      }
     });
   }
 }
