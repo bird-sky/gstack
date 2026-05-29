@@ -23,8 +23,8 @@ describe("cso/spec taxonomy alignment", () => {
     expect(CSO).toContain(line!);
   });
 
-  test("cso lists every HIGH + MEDIUM + LOW pattern id (full table, no drift)", () => {
-    for (const p of PATTERNS) {
+  test("cso lists every HIGH-tier credential id (the archaeology contract, no drift)", () => {
+    for (const p of PATTERNS.filter((x) => x.tier === "HIGH")) {
       expect(CSO).toContain(`\`${p.id}\``);
     }
   });

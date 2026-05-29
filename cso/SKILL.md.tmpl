@@ -160,10 +160,10 @@ INFRASTRUCTURE SURFACE
 Scan git history for leaked credentials, check tracked `.env` files, find CI configs with inline secrets.
 
 **Canonical pattern catalog** (shared with `/spec`'s in-flight redaction, generated
-from `lib/redact-patterns.ts` — the archaeology greps below target the HIGH-tier
-prefixes from this table):
+from `lib/redact-patterns.ts` — the archaeology greps below target these HIGH-tier
+prefixes; full MEDIUM/LOW taxonomy is in `lib/redact-patterns.ts`):
 
-{{REDACT_TAXONOMY_TABLE}}
+{{REDACT_TAXONOMY_TABLE:compact}}
 
 **Git history — known secret prefixes:**
 ```bash
