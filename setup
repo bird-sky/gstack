@@ -82,6 +82,7 @@ SKILL_PREFIX=1
 SKILL_PREFIX_FLAG=0
 TEAM_MODE=0
 NO_TEAM_MODE=0
+PLAN_TUNE_HOOKS_MODE=""   # "" = resolve from env/config/prompt; "yes"/"no" = explicit
 while [ $# -gt 0 ]; do
   case "$1" in
     --host) [ -z "$2" ] && echo "Missing value for --host (expected claude, codex, kiro, factory, opencode, openclaw, hermes, gbrain, or auto)" >&2 && exit 1; HOST="$2"; shift 2 ;;
@@ -91,6 +92,9 @@ while [ $# -gt 0 ]; do
     --no-prefix) SKILL_PREFIX=0; SKILL_PREFIX_FLAG=1; shift ;;
     --team)    TEAM_MODE=1; shift ;;
     --no-team) NO_TEAM_MODE=1; shift ;;
+    --plan-tune-hooks)    PLAN_TUNE_HOOKS_MODE="yes"; shift ;;
+    --no-plan-tune-hooks) PLAN_TUNE_HOOKS_MODE="no"; shift ;;
+    --plan-tune-hooks=*)  PLAN_TUNE_HOOKS_MODE="${1#--plan-tune-hooks=}"; shift ;;
     -q|--quiet) QUIET=1; shift ;;
     *) shift ;;
   esac
@@ -1304,14 +1308,65 @@ if [ "$NO_TEAM_MODE" -ne 1 ] \
     ALREADY_INSTALLED=1
   fi
 
+  # Resolve the desired action without ever blocking.
+  # Priority: CLI flag (--plan-tune-hooks / --no-plan-tune-hooks)
+  #         > env (GSTACK_PLAN_TUNE_HOOKS=yes|no)
+  #         > saved config (plan_tune_hooks)
+  #         > smart default ("prompt" → timed prompt on a real TTY, else skip).
+  # This guarantees scripted/workspace setups (conductor, CI) are never
+  # interactive: pass --no-plan-tune-hooks (or --plan-tune-hooks) and the
+  # block runs to completion with no `read`.
+  PT_DECISION="$PLAN_TUNE_HOOKS_MODE"
+  [ -z "$PT_DECISION" ] && PT_DECISION="${GSTACK_PLAN_TUNE_HOOKS:-}"
+  [ -z "$PT_DECISION" ] && PT_DECISION="$("$GSTACK_CONFIG" get plan_tune_hooks 2>/dev/null || true)"
+  # Normalize: strip whitespace + lowercase so "YES", "Yes", " yes" from a flag
+  # or env var all resolve correctly (an unrecognized opt-in must NOT silently
+  # downgrade to skip). Unknown values fall through to "prompt".
+  PT_DECISION=$(printf '%s' "$PT_DECISION" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')
+  case "$PT_DECISION" in
+    y|yes|true|install|on|1) PT_DECISION="yes" ;;
+    n|no|false|skip|off|0)   PT_DECISION="no" ;;
+    *)                       PT_DECISION="prompt" ;;
+  esac
+
+  _install_plan_tune_hooks() {
+    "$SETTINGS_HOOK" add-event \
+      --event PostToolUse \
+      --matcher '(AskUserQuestion|mcp__.*__AskUserQuestion)' \
+      --command "$PLAN_TUNE_LOG_HOOK" \
+      --source plan-tune-cathedral \
+      --timeout 5
+    "$SETTINGS_HOOK" add-event \
+      --event PreToolUse \
+      --matcher '(AskUserQuestion|mcp__.*__AskUserQuestion)' \
+      --command "$PLAN_TUNE_PREF_HOOK" \
+      --source plan-tune-cathedral \
+      --timeout 5
+  }
+
   if [ "$ALREADY_INSTALLED" -eq 1 ]; then
     log ""
     log "Plan-tune hooks already installed. Run \`$SETTINGS_HOOK list-sources\` to inspect."
+  elif [ "$PT_DECISION" = "yes" ]; then
+    # Explicit opt-in (flag / env / config). Non-interactive.
+    _install_plan_tune_hooks
+    log ""
+    log "Plan-tune hooks installed. Run /plan-tune anytime to inspect."
+    touch "$PLAN_TUNE_INSTALL_MARKER"
+  elif [ "$PT_DECISION" = "no" ]; then
+    # Explicit opt-out (flag / env / config). Non-interactive.
+    log ""
+    log "Plan-tune cathedral hooks not installed (opted out)."
+    log "Install later with: ./setup --plan-tune-hooks  (or /update-config)."
+    touch "$PLAN_TUNE_INSTALL_MARKER"
   elif [ -f "$PLAN_TUNE_INSTALL_MARKER" ]; then
     # Previously declined. Don't re-ask. User can re-enable via /update-config.
     :
-  elif [ -t 0 ] && [ -t 1 ]; then
-    # Interactive install with explicit consent + diff preview.
+  elif [ "$QUIET" -ne 1 ] && [ -t 0 ] && [ -t 1 ]; then
+    # Real interactive terminal with no recorded preference: ask, with explicit
+    # consent + diff preview. The read is time-bounded and defaults to "skip" so
+    # it can never hang an automated/forwarded TTY (the conductor failure mode).
+    _PT_PROMPT_TIMEOUT=10  # single source of truth for the read + the countdown text
     log ""
     log "──────────────────────────────────────────────────────────"
     log "Plan-tune cathedral: install Claude Code hooks?"
@@ -1336,33 +1391,32 @@ if [ "$NO_TEAM_MODE" -ne 1 ] \
     log "Backup: settings.json.bak.<ts> written before any mutation."
     log "Rollback: $SETTINGS_HOOK rollback"
     log ""
-    printf "Install both hooks now? [y/N] "
-    read -r PLAN_TUNE_INSTALL_REPLY
-    if [ "$PLAN_TUNE_INSTALL_REPLY" = "y" ] || [ "$PLAN_TUNE_INSTALL_REPLY" = "Y" ]; then
-      "$SETTINGS_HOOK" add-event \
-        --event PostToolUse \
-        --matcher '(AskUserQuestion|mcp__.*__AskUserQuestion)' \
-        --command "$PLAN_TUNE_LOG_HOOK" \
-        --source plan-tune-cathedral \
-        --timeout 5
-      "$SETTINGS_HOOK" add-event \
-        --event PreToolUse \
-        --matcher '(AskUserQuestion|mcp__.*__AskUserQuestion)' \
-        --command "$PLAN_TUNE_PREF_HOOK" \
-        --source plan-tune-cathedral \
-        --timeout 5
-      log ""
-      log "Plan-tune hooks installed. Run /plan-tune anytime to inspect."
-    else
-      log ""
-      log "Skipped. Re-run ./setup or use /update-config to install later."
-    fi
-    touch "$PLAN_TUNE_INSTALL_MARKER"
+    printf "Install both hooks now? [y/N] (default: N, auto-skips in %ss): " "$_PT_PROMPT_TIMEOUT"
+    read -t "$_PT_PROMPT_TIMEOUT" -r PLAN_TUNE_INSTALL_REPLY </dev/tty 2>/dev/null || PLAN_TUNE_INSTALL_REPLY=""
+    case "$PLAN_TUNE_INSTALL_REPLY" in
+      y|Y)
+        _install_plan_tune_hooks
+        log ""
+        log "Plan-tune hooks installed. Run /plan-tune anytime to inspect."
+        touch "$PLAN_TUNE_INSTALL_MARKER"
+        ;;
+      n|N)
+        log ""
+        log "Skipped. Re-run ./setup --plan-tune-hooks or use /update-config to install later."
+        touch "$PLAN_TUNE_INSTALL_MARKER"
+        ;;
+      *)
+        # Empty / timed out — treat as "ask me again" (don't persist a decline).
+        log ""
+        log "No response — skipped for now. Re-run ./setup --plan-tune-hooks to install."
+        ;;
+    esac
   else
-    # Non-interactive (CI, scripted setup). Don't prompt; print one-liner.
+    # Non-interactive (CI, scripted/workspace setup, quiet). Never prompt.
     log ""
     log "Plan-tune cathedral hooks not installed (non-interactive setup)."
-    log "Install with:"
+    log "Install with: ./setup --plan-tune-hooks"
+    log "  (or set GSTACK_PLAN_TUNE_HOOKS=yes, or run the commands below)"
     log "  $SETTINGS_HOOK add-event --event PostToolUse \\"
     log "    --matcher '(AskUserQuestion|mcp__.*__AskUserQuestion)' \\"
     log "    --command $PLAN_TUNE_LOG_HOOK --source plan-tune-cathedral --timeout 5"

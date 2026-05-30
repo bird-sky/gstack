@@ -1,5 +1,76 @@
 # Changelog
 
+## [1.53.1.0] - 2026-05-30
+
+## **Workspace and scripted setup never hang on a hidden prompt again. Installing the plan-tune hooks is now flag-driven with safe defaults.**
+
+`./setup` asked "Install both hooks now? [y/N]" with a blocking read. Run under a Conductor workspace or any forwarded terminal, that prompt had nobody to answer it, so setup hung forever. Now the decision comes from a flag, an env var, or saved config, and when nobody is there to answer it takes a safe default instead of waiting. A real terminal still gets the prompt, but it is time-bounded (auto-skips after 10s) so it can never stall a pipeline.
+
+### What this means for you
+
+- Spinning up a new workspace just works. `bin/dev-setup` runs fully non-interactively and never rewrites your global Claude settings behind your back.
+- Want the plan-tune hooks installed without a prompt? `./setup --plan-tune-hooks` (or `GSTACK_PLAN_TUNE_HOOKS=yes`, or `gstack-config set plan_tune_hooks yes`). Don't want them? `--no-plan-tune-hooks`. Leave it unset and a real terminal still asks once, then remembers.
+
+### Added
+
+- `--plan-tune-hooks` / `--no-plan-tune-hooks` / `--plan-tune-hooks=yes|no|prompt` flags on `./setup`, plus the `GSTACK_PLAN_TUNE_HOOKS` env var and a `plan_tune_hooks` config key (default `prompt`). Precedence: flag > env > saved config > prompt on a real terminal.
+
+### Fixed
+
+- `./setup` no longer hangs in non-interactive or forwarded-TTY contexts (Conductor workspaces, CI). The plan-tune consent prompt is time-bounded and defaults to skip.
+- `bin/dev-setup` runs setup non-interactively and can no longer silently rewrite your global `~/.claude/settings.json` to point at an ephemeral workspace path that breaks when the workspace is deleted.
+- Opt-in values like `YES`, `Yes`, or ` yes` are honored instead of being silently downgraded to skip, and `gstack-config` now rejects out-of-domain `plan_tune_hooks` values.
+
+### For contributors
+
+- New regression suite `test/setup-plan-tune-hooks-noninteractive.test.ts` (flag wiring, no-blocking-read guard, decision normalization, config round-trip + domain rejection, dev-setup pin) with host-config isolation via a temp `GSTACK_HOME`.
+- Rebaselined `test/parity-suite.test.ts` from the stale v1.44.1 anchor to v1.53.0.0. The 1.05 per-skill ratio is kept (only the anchor moved), absorbing legitimate v1.49–v1.53 planning-skill growth and clearing the 5 pre-existing parity failures noted in the v1.53.0.0 entry. Historical baselines retained for the v1→v2 audit trail.
+- De-flaked `test/plan-tune.test.ts` "derive pushes scope_appetite up" (was ~25–50% flaky, worse on main): it now sets `GSTACK_QUESTION_LOG_NO_DERIVE=1` so gstack-question-log's fire-and-forget background `--derive` can't race the test's explicit one.
+
+## [1.53.0.0] - 2026-05-29
+
+## **Secrets, PII, and legal landmines get caught before they reach a public sink. One redaction engine now guards /spec, /ship, /cso, and the /document-* skills.**
+
+`/spec` used to scan for seven secret patterns and only blocked the codex hand-off. Everything after that — the GitHub issue it filed, the local archive — went out unscanned. So you could pull an AWS key out of the draft, re-run, and still publish a customer's email to a world-readable issue. That gap is closed. A single shared engine (`lib/redact-patterns.ts` + `lib/redact-engine.ts`, driven by the new `gstack-redact` CLI) now scans the exact bytes that will be sent, at every sink: the codex dispatch, the issue body, the archive write, the PR body and title, and generated docs before they commit. HIGH-confidence credentials block. PII and legal/damaging content (a named person tied to "fired", a customer tied to "churn", NDA markers) prompt you per finding, with one-keystroke auto-redact for emails, phones, SSNs, and cards. Public repos get a sterner bar than private ones.
+
+It is a guardrail, not a vault. `git push --no-verify`, a direct `gh issue create`, and `GSTACK_REDACT_PREPUSH=skip` all still get through. It catches accidents and carelessness, which is where real leaks come from.
+
+### The numbers that matter
+
+From the shipped engine and its test suite (`bun test test/redact-*.test.ts` and the per-skill wiring tests):
+
+| Metric | Before (v1.52) | After (v1.53) | Δ |
+|--------|----------------|---------------|---|
+| Redaction patterns | 7 (secrets only) | 33 (secrets + PII + legal + internal) | +26 |
+| Tiers | 1 (block) | 3 (block / confirm / FYI) | +2 |
+| Enforcement sinks in /spec | 1 (codex only) | 3 (codex, issue, archive) | +2 |
+| Skills guarded | 1 (/spec) | 5 (/spec, /ship, /cso, /document-release, /document-generate) | +4 |
+| Redaction tests | ~5 string checks | 159 behavior tests | +154 |
+
+Tier split of the 33 patterns: 17 HIGH (genuinely-secret credentials), 14 MEDIUM (PII, legal, internal-leak, plus high-FP credential shapes), 2 LOW. Calibration is the point: Stripe publishable keys, Google `AIza` keys, JWTs, and env-style `*_KEY=` sit at MEDIUM, not HIGH, because a gate that cries wolf gets muted.
+
+### What this means for you
+
+When you `/spec` or `/ship`, you no longer have to remember that the issue body is public. A real credential stops the operation cold and tells you to rotate it. An email or a sentence naming a coworker surfaces as a question, with auto-redact one keystroke away. Turn on the optional pre-push hook (`gstack-config set redact_prepush_hook true`) to catch the classic `.env`-into-the-diff push too. Nothing new to learn: it runs inside the skills you already use.
+
+### Itemized changes
+
+#### Added
+- **Shared redaction engine.** `lib/redact-patterns.ts` (33-pattern, 3-tier taxonomy — the single source of truth) and `lib/redact-engine.ts` (pure `scan()` + `applyRedactions()` with Unicode normalization, ReDoS-safe size cap, Luhn/entropy/RFC1918 validators, safe-masked previews).
+- **`gstack-redact` CLI** — scan stdin or a file, JSON or human output, exit 0/2/3 to gate skills, `--auto-redact` for the PII one-keystroke path, `--repo-visibility`, `--allowlist`, `--self-email`.
+- **Opt-in pre-push hook** (`gstack-redact-prepush` + `gstack-redact install-prepush-hook`) — blocks a credential in the pushed diff (public and private), correct `remote..local` diff direction with new-branch/force-push/delete handling, chains any existing hook, `GSTACK_REDACT_PREPUSH=skip` escape valve.
+- **`/spec` Phase 4.5a semantic review** — an in-conversation pass (no third party) for named-criticism, customer complaints, unannounced strategy, NDA material, and codename bleed, with a content-free audit trail at `~/.gstack/security/semantic-reviews.jsonl`.
+- **Config keys** `redact_repo_visibility` (local-only override for repos `gh`/`glab` can't read) and `redact_prepush_hook`.
+
+#### Changed
+- **`/spec`, `/ship`, `/document-release`, `/document-generate`** scan at every external sink, on the exact bytes sent (temp-file scan-at-sink, no scan-then-re-render gap). `/ship` wraps Codex/Greptile output in tool-attributed fences so the example credentials those tools quote degrade to a non-blocking warning instead of failing the PR.
+- **`/cso`** shares the same canonical taxonomy via `lib/redact-patterns.ts` for its secrets archaeology.
+
+#### For contributors
+- Skill docs for the redaction surface are generated from `scripts/resolvers/redact-doc.ts` (`{{REDACT_TAXONOMY_TABLE}}`, `{{REDACT_INVOCATION_BLOCK:<sink>}}`), so the five skills never drift from the engine.
+- 12 new test files, 159 redaction assertions, plus a periodic-tier semantic-pass eval (`test/redact-semantic-pass.eval.ts`).
+- Known pre-existing: the legacy `test/parity-suite.test.ts` (v1.44.1 baseline) reports 5 planning-skill size regressions inherited from the brain-aware-planning releases (v1.49–v1.52); they are unrelated to this branch and the active v1.47 size-budget gate passes. Tracked in TODOS.md to rebaseline.
+
 ## [1.52.2.0] - 2026-05-29
 
 ## **Emoji render in make-pdf PDFs on every platform. Linux stops printing tofu boxes, and setup installs the font for you.**
