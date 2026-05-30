@@ -56,8 +56,17 @@ if [ ! -e "$AGENTS_LINK" ]; then
   ln -s "$REPO_ROOT" "$AGENTS_LINK"
 fi
 
-# 6. Run setup via the symlink so it detects .claude/skills/ as its parent
-"$GSTACK_LINK/setup"
+# 6. Run setup via the symlink so it detects .claude/skills/ as its parent.
+#
+# Workspace/dev setup MUST be non-interactive: Conductor runs this under a
+# forwarded pty, so any `read` in setup (skill-prefix prompt, plan-tune hook
+# consent) would hang the workspace forever. Detaching stdin makes every
+# setup prompt take its smart non-interactive default (flat skill names; skip
+# the global plan-tune hook install without writing a decline marker, so a
+# later hands-on `./setup` can still offer it). A dev workspace should never
+# silently mutate ~/.claude/settings.json — pass --plan-tune-hooks explicitly
+# if you do want them. (Saved prefix/config preferences are still honored.)
+"$GSTACK_LINK/setup" </dev/null
 
 echo ""
 echo "Dev mode active. Skills resolve from this working tree."
