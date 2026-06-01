@@ -292,12 +292,12 @@ export const E2E_TOUCHFILES: Record<string, string[]> = {
   // bin/gstack-merge (lib/merge.ts), so those are dependencies of every
   // land-and-deploy E2E — a change to the land skill or the merge helper must
   // re-run the composition path.
-  'land-and-deploy-workflow':      ['land-and-deploy/**', 'land/**', 'bin/gstack-merge', 'lib/merge.ts', 'scripts/gen-skill-docs.ts'],
-  'land-and-deploy-first-run':     ['land-and-deploy/**', 'land/**', 'bin/gstack-merge', 'lib/merge.ts', 'scripts/gen-skill-docs.ts', 'bin/gstack-slug'],
+  'land-and-deploy-workflow':      ['land-and-deploy/**', 'land/**', 'bin/gstack-merge', 'lib/merge.ts', 'scripts/resolvers/merge-queue-setup.ts', 'scripts/gen-skill-docs.ts'],
+  'land-and-deploy-first-run':     ['land-and-deploy/**', 'land/**', 'bin/gstack-merge', 'lib/merge.ts', 'scripts/resolvers/merge-queue-setup.ts', 'scripts/gen-skill-docs.ts', 'bin/gstack-slug'],
   'land-and-deploy-review-gate':   ['land-and-deploy/**', 'land/**', 'bin/gstack-review-read'],
   'canary-workflow':               ['canary/**', 'browse/src/**'],
   'benchmark-workflow':            ['benchmark/**', 'browse/src/**'],
-  'setup-deploy-workflow':         ['setup-deploy/**', 'bin/gstack-merge', 'lib/merge.ts', 'scripts/gen-skill-docs.ts'],
+  'setup-deploy-workflow':         ['setup-deploy/**', 'bin/gstack-merge', 'lib/merge.ts', 'scripts/resolvers/merge-queue-setup.ts', 'scripts/gen-skill-docs.ts'],
 
   // Sidebar agent
   'sidebar-navigate':              ['browse/src/server.ts', 'browse/src/sidebar-agent.ts', 'browse/src/sidebar-utils.ts', 'extension/**'],

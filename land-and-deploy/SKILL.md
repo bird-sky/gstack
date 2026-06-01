@@ -1126,7 +1126,14 @@ Continue to Step 2.
 
 The entire "land" half — pre-flight, CI wait, VERSION-drift check, the pre-merge
 readiness gate, and the actual merge through the right regime (none / GitHub native
-merge queue / trunk.io merge queue) — is owned by the `/land` skill. Run it now:
+merge queue / trunk.io merge queue) — is owned by the `/land` skill. Run it now.
+
+**Run `/land` as if invoked with `--watch`.** `/land`'s default for a queue regime is
+enqueue-and-return (hand the PR to the queue and come back) — but the deploy and revert
+steps below need the *completed* merge and its SHA, so here you MUST block until the PR
+actually lands. Take `/land`'s `--watch` branch at its Step 4.3 (`gstack-merge wait`, then
+Step 5 `write-state`), not the enqueue-and-return branch. If the PR ejects or times out in
+the queue, `/land` STOPs and so do you — there is nothing to deploy.
 
 Read the `/land` skill file at `~/.claude/skills/gstack/land/SKILL.md` using the Read tool.
 

@@ -793,6 +793,9 @@ When the user types `/land`, run this skill.
 - `/land` — auto-detect the PR from the current branch
 - `/land #123` — land a specific PR number
 - `/land --fast` — skip the soft-warning confirmation when there are no blockers. `--fast` NEVER skips a real blocker (failing CI, merge conflict, failing free tests, an unconfirmed merge SHA). It only spares you the "warnings present, proceed?" prompt when everything that matters is green.
+- `/land --watch` — for a **queue** regime (trunk / GitHub native), block and watch until the PR actually lands, instead of the default **enqueue-and-return**. Use it when you want to sit and confirm this one PR landed. (Combine freely, e.g. `/land #123 --fast --watch`.)
+
+**Default for a merge queue is enqueue-and-return.** If the repo uses a queue, `/land` hands the PR to the queue, tells you where to watch, and returns — so you can `/land` a whole stack of ready PRs and walk away while the queue lands them. `--watch` opts into blocking. A no-queue repo always merges synchronously (there's nothing to queue).
 
 ## Non-interactive philosophy — with one critical gate
 
@@ -814,8 +817,8 @@ This is a **mostly automated** workflow. The user said `/land`, which means DO I
 ## Voice & Tone
 - **Narrate what's happening now.** "Checking CI status..." not silence.
 - **Explain why before a gate.** "A merge to main can't be undone without a revert, so I check X first."
-- **Be specific.** "Your repo uses the trunk.io merge queue — I'll enqueue and watch it" not "merging."
-- **First run = teacher mode**; subsequent runs = brief status updates.
+- **Be specific.** "Your repo uses the trunk.io merge queue — I'll enqueue this PR and the queue will land it" not "merging."
+- **First run = teacher mode** (explain what a merge queue is and what enqueue-and-return means before doing it); subsequent runs = brief status updates.
 
 ---
 
@@ -1081,9 +1084,136 @@ Resolution order (platform-agnostic rule — the project owns its config, gstack
    It returns `{"regime":"none|github|trunk","source":"...","base":"..."}`. Detection uses the queue's own GitHub status check (`Trunk Merge Queue (<base>)` → trunk), branch-protection merge queue (→ github), and `.trunk/trunk.yaml` `merge:` as a secondary signal. A bare `.trunk/` directory is NOT treated as trunk (the `trunk check` linter uses the same dir).
 3. **Ask once, then persist** — if there is no config AND detection returns `none` but the user expected a queue (or detection is ambiguous), ask via AskUserQuestion which regime to use, then write a `## Merge Configuration` section to CLAUDE.md so we never ask again. (You can also point them at `/setup-deploy`, which writes this section.)
 
-Tell the user which regime you'll use and why: e.g. "Your repo uses the trunk.io merge queue (detected from the `Trunk Merge Queue (main)` check). I'll enqueue the PR and watch the queue."
+Tell the user which regime you'll use and why: e.g. "Your repo uses the trunk.io merge queue (detected from the `Trunk Merge Queue (main)` check)."
 
 Record the start timestamp.
+
+### 4.1a: Explain what's about to happen (queue regimes)
+
+If the regime is `github` or `trunk`, **before submitting**, tell the user plainly what a
+merge queue is and what `/land` will do. Full version on the first encounter for this repo
+(no `## Merge Configuration` was present), one line on repeats. Gloss "merge queue,"
+"enqueue," and "optimistic merge" on first use.
+
+First-encounter script (adapt to the detected regime):
+
+> "Heads up on how this lands. Your repo uses a **merge queue** (a system that merges
+> PRs for you instead of you clicking merge). So I won't merge right now — I'll **enqueue**
+> this PR (hand it to the queue) and return. The queue tests it and lands it on `<base>`
+> on its own, in parallel with other queued PRs, and **optimistically** (a later PR that
+> already contains this change can rescue it from a flaky test). The point: you can run
+> `/land` on a whole stack of ready PRs and walk away — they'll all make it onto `<base>`
+> without you babysitting. I'll tell you where to watch. (Want me to block and watch this
+> one land instead? Re-run with `/land --watch`.)"
+
+Repeat-encounter: "Enqueuing to the {trunk/GitHub} queue — it'll land on `<base>`. (`--watch` to block.)"
+
+### 4.1b: Offer the merge queue (no-queue repos, first time)
+
+If the regime resolved to `none` AND there was no `## Merge Configuration` (i.e. we did
+not detect a queue and the user never configured one), surface the option once — don't
+force it. Use AskUserQuestion:
+
+- **Re-ground:** "This repo merges directly (no merge queue), so I'll squash-merge this PR
+  now. If you regularly have several PRs ready at once, trunk.io's merge queue can land
+  them all in parallel without you merging each one by hand and waiting. Want me to set it
+  up? It's a one-time setup and I'll walk you through every step."
+- **RECOMMENDATION:** Choose A if you often juggle multiple ready PRs; choose B to just
+  merge this one now.
+- A) Walk me through setting up the trunk.io merge queue first (Completeness: 10/10)
+- B) Just merge this PR directly now — maybe later (Completeness: 7/10)
+
+**If A:** Run the hand-held onboarding below, then re-resolve the regime (it should now be
+`trunk`) and continue. **If B:** continue with the `none` path. Either way, do not re-ask on
+later runs (the choice, or the written `## Merge Configuration`, settles it).
+
+### Set up a merge queue with trunk.io (first-time, hand-held)
+
+**What a merge queue is, in plain English.** Normally you merge one PR, wait for
+it to land, merge the next, wait again — babysitting a line of PRs into the base
+branch one at a time. A **merge queue** flips that: you *enqueue* each ready PR
+and walk away. Trunk tests them (in parallel, and **optimistically** — a later PR
+that already contains an earlier change can rescue it from a flaky failure) and
+**lands them on the base branch for you**, in a safe order. You queue ten PRs in
+a row, close your laptop, and they all make it onto the base branch without you.
+
+That is exactly the workflow this unlocks: `/land` on each PR, then go do
+something else.
+
+**Before you start:** this needs a trunk.io account (the free tier covers small
+teams) and admin access to the GitHub repo. It's a one-time setup. I'll walk each
+step and explain *why*, and verify what I can with `gh`.
+
+**Step 1 — Create / sign in to trunk.io.**
+Open https://app.trunk.io and sign in with GitHub. *(Why: the queue config and
+dashboard live in Trunk's web app, not in your repo — there's no `trunk.yaml`
+merge section to commit.)*
+
+**Step 2 — Install the Trunk GitHub App on this repo.**
+In app.trunk.io → **Merge Queue** → **Create New Queue** → install the GitHub
+App, select this repo, approve permissions. *(Why: the App is what lets the
+`trunk-io` bot test on throwaway branches and push the final merge. Mandatory —
+nothing works without it.)*
+Verify the App can see the repo:
+```bash
+gh api "/repos/<owner>/<repo>/installation" --jq '.app_slug' 2>/dev/null || echo "App not detected yet"
+```
+
+**Step 3 — Create a queue for this repo + base branch.**
+In the same flow, pick this repo and target branch `<base>`, click **Create
+Queue**. *(Why: a queue is scoped to one branch — you're queuing merges into
+`<base>`.)*
+
+**Step 4 — Adjust branch protection (3 changes).**
+In GitHub → Settings → Branches → the `<base>` rule:
+- **Allow the `trunk-io` bot to push to the protected branch.** *(Why: Trunk's
+  bot performs the actual merge; without push rights it can't land anything.)*
+- **Disable "Require branches to be up to date before merging."** *(Why: Trunk
+  tests each PR against the others in the queue, so GitHub's own up-to-date gate
+  would fight it.)*
+- **Exclude `trunk-merge/*` and `trunk-temp/*` from protection.** *(Why: those
+  are the throwaway branches Trunk tests on; protecting them blocks testing.)*
+
+**Step 5 — Turn on the optimizations that make "queue many, walk away" real.**
+In app.trunk.io → your repo → Merge Queue → Settings, enable:
+- **Optimistic Merge Queue** + **Pending Failure Depth ≥ 1** — keeps testing
+  later PRs while an earlier one is in "pending failure," and auto-recovers when a
+  later PR proves the failure was a flake. *(Why: one flaky PR doesn't stall the
+  whole line.)*
+- **Parallel** — non-overlapping PRs test in independent lanes at the same time.
+  *(Why: throughput; ten unrelated PRs don't go one-at-a-time.)*
+- **Batching** — lands compatible PRs together with auto-bisection on failure.
+  *(Why: fewer CI runs, and a bad PR doesn't eject the whole batch.)*
+- **Merge Method** — pick Squash / Merge Commit / Rebase to match your repo. *(Why:
+  it controls what the landed commit looks like; `/land` handles all three.)*
+
+**Step 6 — Pick how PRs get enqueued.**
+The simplest works immediately: commenting **`/trunk merge`** on a PR. `/land`
+uses that by default — zero extra auth, because the GitHub App is already
+installed. *(Optional upgrades: set an "enqueue by label" name in the web UI, run
+`trunk login` to use the `trunk` CLI, or set `$TRUNK_API_TOKEN` for the REST
+API — `/land` will prefer those when present.)*
+
+**Step 7 — Persist the choice so I never ask again.**
+I'll write `Merge queue: trunk` into a `## Merge Configuration` section of
+CLAUDE.md. *(Why: `/land` reads it and skips detection from then on.)*
+
+**Step 8 — Verify end-to-end.**
+Open any test PR and run `/land`. You should see a **`Trunk Merge Queue
+(<base>)`** check appear, move Queued → Testing → Merged, and the PR land on
+`<base>` without you touching GitHub:
+```bash
+gh pr checks <test-pr> --json name,state | grep -i "Trunk Merge Queue" || echo "no queue check yet — recheck Steps 2-4"
+```
+
+Full docs: https://docs.trunk.io/merge-queue/getting-started
+
+Once this is done, the payoff: queue up all your ready PRs with `/land`, walk
+away, and trunk lands them on `<base>` for you.
+
+When the onboarding completes, write `Merge queue: trunk` into a `## Merge Configuration`
+section of CLAUDE.md (create the section if absent) so `/land` never has to ask again, then
+re-run `gstack-merge detect` to confirm, and continue with the `trunk` regime.
 
 ### 4.2: Submit
 
@@ -1143,24 +1273,45 @@ gh pr view --json autoMergeRequest -q .autoMergeRequest
 
 **Hard rule: never call `gh pr merge` a second time** after a non-zero exit. Server state is authoritative.
 
-### 4.3: Wait for it to land
+### 4.3: Enqueue-and-return (default) or watch until landed
+
+```bash
+eval "$(~/.claude/skills/gstack/bin/gstack-slug 2>/dev/null)"
+```
+
+**Regime `none`** — the direct squash in 4.2 already merged synchronously. Go straight to Step 5 (write-state confirms the SHA).
+
+**Regime `github` / `trunk`, DEFAULT (no `--watch`)** — confirm the queue actually picked the PR up, then return; the queue lands it:
+
+```bash
+~/.claude/skills/gstack/bin/gstack-merge confirm-enqueue --regime <regime> --pr <NNN> --base <base> --slug "$SLUG"
+```
+
+- **exit 0 / `ENQUEUED=...`** — the PR is in the queue and will land on `<base>` on its own. Do NOT run Step 5 (there is no merge SHA yet — `confirm-enqueue` wrote a lightweight `last-enqueue.json`). Go to Step 6's **enqueue summary**, and surface the `WATCH_CHECK` / `WATCH_DASHBOARD` lines from the output so the user knows where to look.
+- **`TRUNK_ENQUEUE_TIMEOUT`** — **STOP.** "I posted `/trunk merge` but Trunk never picked it up. Confirm the Trunk GitHub App is installed on this repo and 'GitHub commands' is enabled (run `/land` on a no-queue repo, or `/setup-deploy`, for the setup walkthrough), then run `/land` again."
+- **`ENQUEUE_UNCONFIRMED`** (github) — **STOP.** "GitHub auto-merge didn't enable on the PR. Check the repo's merge-queue / auto-merge settings, then run `/land` again."
+
+**Regime `github` / `trunk` WITH `--watch`** — block until it actually lands:
 
 ```bash
 ~/.claude/skills/gstack/bin/gstack-merge wait --regime <regime> --pr <NNN> --base <base>
 ```
 
-The helper polls the uniform landing signal (`gh pr view state` + the merge-queue status check) and prints progress. For the trunk regime it first confirms the PR was actually picked up (the `Trunk Merge Queue (<base>)` check appears) — a posted `/trunk merge` comment is silently inert if the GitHub App isn't installed.
-
-Handle the exit:
-- **exit 0 / `LAND_STATUS=landed`** — it merged. Continue to Step 5.
+The helper polls the uniform landing signal (`gh pr view state` + the merge-queue status check). For trunk it first confirms pickup (the `Trunk Merge Queue (<base>)` check appears) — a posted `/trunk merge` comment is silently inert if the GitHub App isn't installed. Handle the exit:
+- **`LAND_STATUS=landed`** — continue to Step 5.
 - **`LAND_STATUS=ejected`** — the queue rejected the PR (a CI check failed on the merge candidate, or a conflict with another queued PR). **STOP.** "The merge queue ejected this PR: {reason}. Check the queue page — usually a check failed on the merge commit. Fix and run `/land` again."
 - **`LAND_STATUS=closed`** — **STOP.** "The PR was closed without merging."
-- **`TRUNK_ENQUEUE_TIMEOUT`** — **STOP.** "I posted `/trunk merge` but Trunk never picked it up. Confirm the Trunk GitHub App is installed on this repo and 'GitHub commands' is enabled, then run `/land` again."
+- **`TRUNK_ENQUEUE_TIMEOUT`** — **STOP.** (same guidance as above.)
 - **timeout** — **STOP.** "The merge has been pending for {duration}. Something may be stuck — check the GitHub Actions tab and the merge-queue page."
 
 ---
 
 ## Step 5: Confirm landing and write the handoff
+
+**Run this step only when the PR actually merged** — i.e. the `none` regime, or a `--watch`
+run that returned `LAND_STATUS=landed`. In the default enqueue-and-return path you already
+returned at 4.3 with the PR sitting in the queue (no merge SHA yet), so skip to Step 6's
+**enqueue summary**.
 
 A merge isn't done until the commit is on the base branch with a known SHA. This is also the **handoff** the deploy half needs (its `git revert` and deploy-workflow match both need the merge SHA), so `/land` writes it as a file, not just a log line.
 
@@ -1184,9 +1335,30 @@ and prints a human echo: `LANDED: pr=#NNN sha=<oid> regime=<regime> base=<branch
 
 ---
 
-## Step 6: Land summary
+## Step 6: Summary
 
-When run standalone, print a short summary (skip the deploy framing — there is none here):
+### Enqueue summary (default queue path — the PR is in the queue, not yet landed)
+
+When 4.3 returned `ENQUEUED=...`, print this and stop — the queue does the rest:
+
+```
+ENQUEUED
+════════
+PR:           #<number> — <title>
+Branch:       <head> → <base>
+Regime:       <github / trunk>
+Status:       In the merge queue — it'll land on <base> automatically
+Watch:        <WATCH_CHECK>  (and <WATCH_DASHBOARD> for trunk)
+
+VERDICT: ENQUEUED — no action needed; the queue will land it.
+```
+
+Then tell the user, in plain English: "You don't need to wait. Queue up your other ready
+PRs with `/land` the same way and walk away — the queue lands them all on `<base>`. To
+block and watch one land instead, run `/land --watch`." (Skip the walk-away pitch if this
+was invoked by `/land-and-deploy`.)
+
+### Land summary (none regime, or `--watch` that landed)
 
 ```
 LAND REPORT
@@ -1212,6 +1384,7 @@ Then suggest the natural next step: "Want to deploy and verify this in productio
 - **Never skip CI.** Failing or pending checks gate the merge.
 - **Never call `gh pr merge` twice** after a non-zero exit — server state is authoritative (see 4.2). Related: cli/cli#3442, cli/cli#13380.
 - **Trunk owns the trunk path.** In the trunk regime, never run `gh pr merge` and never pass `--delete-branch`.
-- **Landing means a SHA on the base branch.** Don't report success until `write-state` confirms it (Step 5). A null SHA silently kills the deploy half's revert.
+- **A merge queue means enqueue-and-return, not babysit.** For a queue regime the default is to enqueue and return so the user can `/land` a whole stack and walk away; only `--watch` blocks. Never block-by-default on a queue — it defeats the point of the queue.
+- **Landing means a SHA on the base branch.** In the `none` path or a `--watch` run, don't report success until `write-state` confirms it (Step 5). A null SHA silently kills the deploy half's revert. (In enqueue-and-return there is intentionally no SHA yet — that's why `/land-and-deploy` always runs `/land --watch`.)
 - **Detect, don't assume.** Resolve the regime from config → live detection → ask-once-and-persist. The same `gstack-merge detect` is what `/land-and-deploy`'s dry-run uses, so the two never disagree.
 - **Narrate the journey.** The user should always know what just happened, what's happening now, and what's next.

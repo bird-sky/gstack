@@ -39,13 +39,15 @@ describe("PR #1620 post-failure PR-state check in /land template", () => {
     expect(readTmpl()).toMatch(/### 4\.2a: Post-failure PR-state check/);
   });
 
-  test("post-failure check comes before the wait step", () => {
+  test("post-failure check comes before the landing step (4.3)", () => {
     const body = readTmpl();
     const postfail = body.indexOf("### 4.2a: Post-failure PR-state check");
-    const wait = body.indexOf("### 4.3: Wait for it to land");
+    // 4.3 is the landing step (enqueue-and-return by default, or --watch). Match
+    // the section number, not its title, so D4's rename doesn't break the order check.
+    const landing = body.indexOf("### 4.3:");
     expect(postfail).toBeGreaterThan(-1);
-    expect(wait).toBeGreaterThan(-1);
-    expect(postfail).toBeLessThan(wait);
+    expect(landing).toBeGreaterThan(-1);
+    expect(postfail).toBeLessThan(landing);
   });
 
   test("Universal invariant + upstream gh bug references", () => {
