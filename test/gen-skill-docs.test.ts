@@ -1505,6 +1505,52 @@ describe('/land skill composition', () => {
   });
 });
 
+// --- /land enqueue-and-return + onboarding (D4/D5/D6) ---
+
+describe('/land enqueue-and-return + merge-queue onboarding', () => {
+  const landMd = fs.readFileSync(path.join(ROOT, 'land', 'SKILL.md'), 'utf-8');
+  const setupMd = fs.readFileSync(path.join(ROOT, 'setup-deploy', 'SKILL.md'), 'utf-8');
+  const ladMd = fs.readFileSync(path.join(ROOT, 'land-and-deploy', 'SKILL.md'), 'utf-8');
+
+  test('D4: enqueue-and-return is the default for queue regimes, with a --watch opt-in', () => {
+    expect(landMd).toContain('confirm-enqueue');
+    expect(landMd).toContain('enqueue-and-return');
+    expect(landMd).toContain('--watch');
+    // The default must NOT block on the queue; --watch is the blocking path.
+    expect(landMd).toMatch(/Default for a merge queue is enqueue-and-return/i);
+  });
+
+  test('D4: land-and-deploy forces /land into --watch (it needs the completed merge)', () => {
+    expect(ladMd).toContain('--watch');
+    expect(ladMd).toMatch(/as if invoked with .*--watch|--watch branch/);
+  });
+
+  test('D5: the skill explains what a merge queue is and what it will do', () => {
+    expect(landMd).toMatch(/what a merge queue is|how this lands/i);
+    expect(landMd).toMatch(/walk away/i);
+    expect(landMd).toContain('optimistic');
+  });
+
+  test('D6: the shared {{MERGE_QUEUE_SETUP}} onboarding resolves in BOTH /land and /setup-deploy', () => {
+    // No literal placeholder left anywhere.
+    expect(landMd).not.toContain('{{MERGE_QUEUE_SETUP}}');
+    expect(setupMd).not.toContain('{{MERGE_QUEUE_SETUP}}');
+    // The authoritative onboarding text appears in both (single source, two includes).
+    expect(landMd).toContain('Set up a merge queue with trunk.io');
+    expect(setupMd).toContain('Set up a merge queue with trunk.io');
+    // It hand-holds the load-bearing trunk steps.
+    expect(landMd).toContain('Trunk GitHub App');
+    expect(landMd).toContain('app.trunk.io');
+    expect(landMd).toMatch(/trunk-merge\/\*/);
+  });
+
+  test('bin/gstack-merge exposes the confirm-enqueue subcommand', () => {
+    const bin = fs.readFileSync(path.join(ROOT, 'bin', 'gstack-merge'), 'utf-8');
+    expect(bin).toContain("case 'confirm-enqueue':");
+    expect(bin).toContain('last-enqueue.json');
+  });
+});
+
 // --- {{CHANGELOG_WORKFLOW}} resolver tests ---
 
 describe('CHANGELOG_WORKFLOW resolver', () => {
