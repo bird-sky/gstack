@@ -61,6 +61,8 @@ We're building a new user dashboard that shows recent activity, notifications, a
       path.join(ROOT, 'plan-ceo-review', 'SKILL.md'),
       path.join(planDir, 'plan-ceo-review', 'SKILL.md'),
     );
+    // Carved skills (v2 plan T9): copy sections/ so the review workflow + report template are present.
+    { const _sec = path.join(ROOT, 'plan-ceo-review', 'sections'); if (fs.existsSync(_sec)) fs.cpSync(_sec, path.join(planDir, 'plan-ceo-review', 'sections'), { recursive: true }); }
   });
 
   afterAll(() => {
@@ -145,6 +147,8 @@ We're building a new user dashboard that shows recent activity, notifications, a
       path.join(ROOT, 'plan-ceo-review', 'SKILL.md'),
       path.join(planDir, 'plan-ceo-review', 'SKILL.md'),
     );
+    // Carved skills (v2 plan T9): copy sections/ so the review workflow + report template are present.
+    { const _sec = path.join(ROOT, 'plan-ceo-review', 'sections'); if (fs.existsSync(_sec)) fs.cpSync(_sec, path.join(planDir, 'plan-ceo-review', 'sections'), { recursive: true }); }
   });
 
   afterAll(() => {
@@ -213,6 +217,8 @@ describeIfSelected('Plan CEO Review Expansion Energy E2E', ['plan-ceo-review-exp
       path.join(ROOT, 'plan-ceo-review', 'SKILL.md'),
       path.join(planDir, 'plan-ceo-review', 'SKILL.md'),
     );
+    // Carved skills (v2 plan T9): copy sections/ so the review workflow + report template are present.
+    { const _sec = path.join(ROOT, 'plan-ceo-review', 'sections'); if (fs.existsSync(_sec)) fs.cpSync(_sec, path.join(planDir, 'plan-ceo-review', 'sections'), { recursive: true }); }
   });
 
   afterAll(() => {
@@ -319,6 +325,8 @@ Replace session-cookie auth with JWT tokens. Currently using express-session + R
       path.join(ROOT, 'plan-eng-review', 'SKILL.md'),
       path.join(planDir, 'plan-eng-review', 'SKILL.md'),
     );
+    // Carved skills (v2 plan T9): copy sections/ so the review workflow + report template are present.
+    { const _sec = path.join(ROOT, 'plan-eng-review', 'sections'); if (fs.existsSync(_sec)) fs.cpSync(_sec, path.join(planDir, 'plan-eng-review', 'sections'), { recursive: true }); }
   });
 
   afterAll(() => {
@@ -415,6 +423,8 @@ export function main() { return Dashboard(); }
       path.join(ROOT, 'plan-eng-review', 'SKILL.md'),
       path.join(planDir, 'plan-eng-review', 'SKILL.md'),
     );
+    // Carved skills (v2 plan T9): copy sections/ so the review workflow + report template are present.
+    { const _sec = path.join(ROOT, 'plan-eng-review', 'sections'); if (fs.existsSync(_sec)) fs.cpSync(_sec, path.join(planDir, 'plan-eng-review', 'sections'), { recursive: true }); }
 
     // Set up remote-slug shim and browse shims (plan-eng-review uses remote-slug for artifact path)
     setupBrowseShims(planDir);
@@ -663,6 +673,8 @@ We're building a real-time notification system for our SaaS app.
       path.join(ROOT, 'plan-eng-review', 'SKILL.md'),
       path.join(planDir, 'plan-eng-review', 'SKILL.md'),
     );
+    // Carved skills (v2 plan T9): copy sections/ so the review workflow + report template are present.
+    { const _sec = path.join(ROOT, 'plan-eng-review', 'sections'); if (fs.existsSync(_sec)) fs.cpSync(_sec, path.join(planDir, 'plan-eng-review', 'sections'), { recursive: true }); }
   });
 
   afterAll(() => {
