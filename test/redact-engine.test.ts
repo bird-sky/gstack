@@ -49,6 +49,36 @@ describe("HIGH credential patterns", () => {
     });
   }
 
+  // #1868 — modern OpenAI keys use base64url bodies (with - and _). The old
+  // [A-Za-z0-9]{32,} regex stopped at the first separator and missed them all,
+  // failing a HIGH credential OPEN through the redaction gate.
+  test("openai.key flags modern sk-proj-/sk-svcacct-/sk-admin- shapes (#1868)", () => {
+    const missed = [
+      "sk-proj-Ab12_Cd34-Ef56Gh78Ij90Kl12Mn34Op56Qr78St90Uv",
+      "sk-svcacct-abc_def-ghijklmnopqrstuvwxyz0123456789ABCDEF",
+      "sk-admin-AAAA_BBBB-CCCC_DDDD-EEEE_FFFF-GGGG_HHHH1234",
+    ];
+    for (const key of missed) {
+      expect(ids(`OPENAI_API_KEY=${key}`)).toContain("openai.key");
+    }
+    // legacy contiguous shape still flags
+    expect(ids("sk-proj-" + "a".repeat(40))).toContain("openai.key");
+  });
+
+  test("openai.key does not over-match prose / malformed sk- strings (#1868 calibration)", () => {
+    // HIGH tier BLOCKS, so false positives on prose are costly. None of these
+    // should flag as openai.key.
+    const benign = [
+      "the sk-learning-rate-schedule-was-tuned-carefully", // hyphenated prose
+      "sk--double-dash-typo-not-a-real-key",
+      "use sk-proj for the project prefix in docs", // no body
+      "sk-short", // too short, no prefix
+    ];
+    for (const text of benign) {
+      expect(ids(text)).not.toContain("openai.key");
+    }
+  });
+
   test("twilio.auth_token needs an SID nearby", () => {
     const sid = "AC" + "a".repeat(32);
     const tok = "b".repeat(32);
