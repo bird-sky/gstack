@@ -2283,3 +2283,32 @@ into `test/helpers/fake-gbrain.ts` when the second consumer arrives
 runs).
 
 **Depends on:** None.
+
+### P2: Real-session carve canary (E3, deferred from carve-guard plan)
+
+**What:** Wire a real-session section-Read-miss canary on top of the
+carved skills. When a real user session drives a carved skill and the
+agent does NOT Read a section the skeleton's STOP directive pointed it
+at, log it (salted, content-free) to
+`~/.gstack/analytics/section-reads.jsonl` and surface drift via
+`bun run eval:summary`. Non-blocking alert, never a merge gate
+(real-session data is non-deterministic).
+
+**Why:** The static (E2) + behavioral (T2) guards prove carves are
+structurally sound and that a real agent Reads sections in a controlled
+eval. They do NOT see production drift — a prompt-context change that
+makes live agents start skipping a section. The canary is the only
+mechanism that catches that, from real usage.
+
+**Context:** Deferred from the carve-guard-hardening plan (D5→T2, codex
+outside-voice #7). `test/helpers/transcript-section-logger.ts` exists but
+is built for deterministic test transcripts + ship action fingerprints,
+NOT real-session drift — it needs rework before it can back this. Ship
+the deterministic guards first; add this once they've proven useful. The
+carved-skill set + each skill's `requiredReads` are already declared in
+`test/helpers/carve-guards.ts`, so the canary reads its expectations
+from there.
+
+**Effort:** M (human ~2d, CC ~4h).
+
+**Depends on:** `transcript-section-logger.ts` real-session-drift rework.
