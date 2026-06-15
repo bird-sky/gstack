@@ -821,7 +821,21 @@ Do NOT proceed until all five are answered without hand-waving.
 2-4 keywords from the user's request and the working title you have in mind, then:
 
 ```bash
-gh issue list --search "<keywords>" --state open --limit 10 --json number,title,url 2>&1
+REMOTE_URL=$(git remote get-url origin 2>/dev/null || echo "")
+case "$REMOTE_URL" in
+  *gitee.com*)
+    OWNER_REPO=$(echo "$REMOTE_URL" | sed -n 's|.*gitee.com/\([^/]*/[^.]*\).*|\1|p')
+    TOKEN="${GITEE_TOKEN:-}"
+    if [ -n "$TOKEN" ] && [ -n "$OWNER_REPO" ]; then
+      curl -s "https://gitee.com/api/v5/repos/${OWNER_REPO}/issues?state=open&page=1&per_page=20&access_token=${TOKEN}"
+    else
+      echo "GITEE_TOKEN_NOT_SET"
+    fi
+    ;;
+  *)
+    gh issue list --search "<keywords>" --state open --limit 10 --json number,title,url 2>&1
+    ;;
+esac
 ```
 
 Interpret the result:
@@ -830,6 +844,8 @@ Interpret the result:
 - **1+ matches:** surface them to the user via AskUserQuestion: "Found {N} similar
   open issue(s): #{n1} ({title}), #{n2} ({title})... Merge with one of these, or
   file a new spec anyway?" Options: pick one to merge / file new anyway / cancel.
+- **Gitee: `GITEE_TOKEN_NOT_SET`:** print: "Dedupe skipped — set GITEE_TOKEN env
+  var and re-invoke `/spec` to enable duplicate detection." Continue.
 - **`gh` not installed:** print: "Dedupe skipped — `gh` is not installed. Install
   from https://cli.github.com/ or use `--no-dedupe` to silence. Continuing without
   duplicate check." Continue to Phase 2.
@@ -837,8 +853,7 @@ Interpret the result:
   not logged in. Run `gh auth login` and re-invoke `/spec` to enable duplicate
   detection. Continuing without check." Continue.
 - **Rate-limited (HTTP 403 with rate-limit message):** print: "Dedupe skipped —
-  GitHub API rate limit reached (60/hr unauthenticated, 5000/hr authed). Re-invoke
-  after the limit resets, or `gh auth login` to authenticate. Continuing." Continue.
+  API rate limit reached. Re-invoke later, or authenticate. Continuing." Continue.
 - **Other error:** print: "Dedupe failed — {stderr line}. Use `--no-dedupe` to
   silence. Continuing without check." Continue.
 
@@ -950,10 +965,12 @@ file, pass the SAME file downstream. Never scan a string then re-render it.
 ```bash
 command -v bun >/dev/null 2>&1 || echo "redaction scan skipped — bun not on PATH"
 # Resolve visibility once; cache + reuse. Order: local config (~/.gstack, never
-# committed) → gh → glab → unknown(=public-strict).
+# committed) → gh → glab → gitee → unknown(=public-strict).
 REDACT_VIS=$(~/.claude/skills/gstack/bin/gstack-config get redact_repo_visibility 2>/dev/null)
 [ -z "$REDACT_VIS" ] && REDACT_VIS=$(gh repo view --json visibility -q .visibility 2>/dev/null | tr 'A-Z' 'a-z')
 [ -z "$REDACT_VIS" ] && REDACT_VIS=$(glab repo view -F json 2>/dev/null | grep -o '"visibility":"[^"]*"' | head -1 | sed 's/.*:"//;s/"//' | tr 'A-Z' 'a-z')
+# Gitee fallback: assume public if remote is gitee
+[ -z "$REDACT_VIS" ] && git remote get-url origin 2>/dev/null | grep -q gitee.com && REDACT_VIS="public"
 REDACT_VIS="${REDACT_VIS:-unknown}"
 REDACT_FILE=$(mktemp)
 cat > "$REDACT_FILE" <<'REDACT_BODY_EOF'
@@ -1812,20 +1829,47 @@ reuse it; write the exact bytes to `$REDACT_FILE`; `~/.claude/skills/gstack/bin/
 exit-3/2/0 handling. On exit 3, do NOT file the issue; HIGH has no skip. Pass the
 same `$REDACT_FILE` downstream so the bytes scanned are the bytes sent.
 
-If `gh` is available and authenticated, file from the scanned temp file:
+File the issue from the scanned temp file. Detect remote type first:
 
 ```bash
-ISSUE_URL=$(gh issue create --title "<title>" --body-file "$REDACT_FILE")
-ISSUE_NUMBER=$(echo "$ISSUE_URL" | sed -E 's|.*/issues/([0-9]+)$|\1|')
-echo "Filed: $ISSUE_URL"
-~/.claude/skills/gstack/bin/gstack-decision-log '{"decision":"Spec filed #ISSUE_NUMBER: TITLE","rationale":"APPROACH","scope":"issue","issue":"ISSUE_NUMBER","source":"skill","confidence":7}' 2>/dev/null || true
+REMOTE_URL=$(git remote get-url origin 2>/dev/null || echo "")
+case "$REMOTE_URL" in
+  *gitee.com*)
+    OWNER_REPO=$(echo "$REMOTE_URL" | sed -n 's|.*gitee.com/\([^/]*/[^.]*\).*|\1|p')
+    OWNER=$(echo "$OWNER_REPO" | cut -d/ -f1)
+    REPO=$(echo "$OWNER_REPO" | cut -d/ -f2)
+    TOKEN="${GITEE_TOKEN:-}"
+    if [ -n "$TOKEN" ] && [ -n "$OWNER_REPO" ]; then
+      BODY=$(cat "$REDACT_FILE" 2>/dev/null)
+      RESP=$(curl -s -X POST "https://gitee.com/api/v5/repos/${OWNER}/issues?access_token=${TOKEN}" \
+        --form "title=<title>" \
+        --form "body=${BODY}" \
+        --form "repo=${REPO}")
+      ISSUE_URL=$(echo "$RESP" | python3 -c "import sys,json; print(json.load(sys.stdin).get('html_url',''))" 2>/dev/null)
+      ISSUE_NUMBER=$(echo "$RESP" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('number',''))" 2>/dev/null)
+      if [ -n "$ISSUE_URL" ]; then
+        echo "Filed: $ISSUE_URL"
+      else
+        echo "Gitee API error: $(echo "$RESP" | python3 -c "import sys,json; print(json.load(sys.stdin).get('message','unknown'))" 2>/dev/null)"
+        echo "Falling back to manual paste..."
+      fi
+    else
+      echo "GITEE_TOKEN not set — title and body below for paste into Gitee"
+    fi
+    ;;
+  *)
+    ISSUE_URL=$(gh issue create --title "<title>" --body-file "$REDACT_FILE" 2>/dev/null)
+    if [ -n "$ISSUE_URL" ]; then
+      ISSUE_NUMBER=$(echo "$ISSUE_URL" | sed -E 's|.*/issues/([0-9]+)$|\1|')
+      echo "Filed: $ISSUE_URL"
+    else
+      echo "gh not available — title and body below for paste into GitHub Issues"
+    fi
+    ;;
+esac
 ```
 
-The last line records the spec as a durable, issue-scoped cross-session decision so a future session (or `/ship` closing the issue) inherits the core approach and why, not just the issue link. Non-interactive, best-effort (`|| true`). Substitute `ISSUE_NUMBER` (from the filed issue), `TITLE` (the issue title), and `APPROACH` (the one core approach/decision the spec settled). Only fires when the issue was actually filed.
-
-If `gh` is not available, print: "`gh` not authenticated — title and body below
-for paste into https://github.com/{owner}/{repo}/issues/new with zero
-reformatting needed." Then emit the rendered title + body.
+If neither Gitee token nor `gh` is available, emit the rendered title + body for manual paste.
 
 **Capture `$ISSUE_NUMBER`** — it goes in the archive frontmatter (next step) and
 is consumed by `/ship` for auto-close.
